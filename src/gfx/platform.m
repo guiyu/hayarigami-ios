@@ -8,6 +8,7 @@
 #include <libkern/OSCacheControl.h>
 #include "vertex.h"
 #include "commands.h"
+#include "sampler.h"
 #include "nvn_deswizzle.h"
 extern const char *const hy_nvn_names[];
 extern void *const hy_nvn_gates[];
@@ -24,7 +25,7 @@ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { void *device, *storage; size_t size; uint32_t flags; } PoolBuilder;
 typedef struct {
     void *storage, *buffer; size_t size, offset; uint32_t flags;
-    struct TextureBacking *textures; pthread_mutex_t lock;
+    struct TextureBacking *textures; unsigned buffers; pthread_mutex_t lock;
 } Pool;
 // Descriptors are host references, never Maxwell descriptor words.
 typedef struct { void *resource; void *view; } Descriptor;
@@ -54,6 +55,23 @@ typedef struct { int level, levels, layer, layers, format, target; uint8_t field
 typedef struct { void *device, *native; int count, interval; Texture *textures[4]; } WindowBuilder;
 typedef struct { WindowBuilder builder; int next, crop[4]; } Window;
 _Static_assert(sizeof(TextureView) <= 32 && sizeof(WindowBuilder) <= 64 && sizeof(Window) <= 384, "NVN view/window ABI sizes");
+@interface HySampler : NSObject {
+@public
+    HySamplerConfig config;
+@private
+    id<MTLSamplerState> state;
+}
+- (id<MTLSamplerState>)stateForDevice:(id<MTLDevice>)target;
+@end
+@implementation HySampler
+- (id<MTLSamplerState>)stateForDevice:(id<MTLDevice>)target {
+    @synchronized (self) {
+        if (!state) state=hy_sampler_create(target,&config);
+        if (!state) hy_fail("Metal sampler allocation failed");
+        return state;
+    }
+}
+@end
 static void initialize(void *driver_memory, size_t size) {
     (void)driver_memory; (void)size; // Switch driver IPC storage is not used by Metal.
     @autoreleasepool {
@@ -145,7 +163,7 @@ static uint32_t pool_initialize(Pool **object, const PoolBuilder *b) {
 static void pool_finalize(Pool **object) {
     Pool *p = *object;
     if (!p) hy_fail("invalid NVN memory pool finalize");
-    if (p->textures) hy_fail("memory pool finalized with live textures");
+    if (p->textures || p->buffers) hy_fail("memory pool finalized with live resources");
     @autoreleasepool {
         id<MTLCommandBuffer> fence = [queue commandBuffer]; [fence commit]; [fence waitUntilCompleted];
         id buffer = (__bridge_transfer id)p->buffer; (void)buffer;
@@ -160,6 +178,37 @@ static void pool_flush(Pool *const *object, ptrdiff_t offset, size_t size) {
     Pool *p = *object;
     if (offset < 0 || (size_t)offset > p->size || size > p->size - (size_t)offset) hy_fail("NVN pool flush out of bounds");
     sys_dcache_flush((uint8_t *)p->storage + offset, size);
+}
+typedef struct { void *device; Pool **pool; ptrdiff_t offset; size_t size; } BufferBuilder;
+typedef struct { Pool **handle; Pool *pool; size_t offset, size; } Buffer;
+_Static_assert(sizeof(BufferBuilder)<=64 && sizeof(Buffer)<=48,"NVN buffer ABI sizes");
+static void buffer_defaults(BufferBuilder *b) { void *d=b->device; memset(b,0,sizeof *b); b->device=d; }
+static void buffer_device(BufferBuilder *b, void *d) { b->device=d; }
+static void buffer_storage(BufferBuilder *b, Pool **pool, ptrdiff_t offset, size_t size) {
+    b->pool=pool; b->offset=offset; b->size=size;
+}
+static uint32_t buffer_initialize(Buffer *b, const BufferBuilder *builder) {
+    if (!builder->device || !builder->pool || !*builder->pool) hy_fail("buffer device or pool missing");
+    Pool *pool=*builder->pool;
+    if (builder->offset<0 || !builder->size || (size_t)builder->offset>pool->size ||
+        builder->size>pool->size-(size_t)builder->offset) hy_fail("buffer storage outside pool");
+    *b=(Buffer){builder->pool,pool,(size_t)builder->offset,builder->size};
+    pthread_mutex_lock(&pool->lock); pool->buffers++; pthread_mutex_unlock(&pool->lock);
+    return 1;
+}
+static void buffer_finalize(Buffer *b) {
+    if (!b->pool) hy_fail("invalid buffer finalize");
+    pthread_mutex_lock(&b->pool->lock); b->pool->buffers--; pthread_mutex_unlock(&b->pool->lock);
+    memset(b,0,sizeof *b);
+}
+static void *buffer_map(const Buffer *b) { return (b->pool->flags&1) ? NULL : (uint8_t *)b->pool->storage+b->offset; }
+static uint64_t buffer_address(const Buffer *b) { return (uintptr_t)b->pool->storage+b->offset; }
+static size_t buffer_size(const Buffer *b) { return b->size; }
+static ptrdiff_t buffer_offset(const Buffer *b) { return b->offset; }
+static Pool **buffer_pool(const Buffer *b) { return b->handle; }
+static void buffer_flush(const Buffer *b, ptrdiff_t offset, size_t size) {
+    if (offset<0 || (size_t)offset>b->size || size>b->size-(size_t)offset) hy_fail("buffer flush out of range");
+    pool_flush(&b->pool,(ptrdiff_t)b->offset+offset,size);
 }
 static uint32_t descriptor_initialize(DescriptorPool *d, Pool *const *pool, ptrdiff_t offset, int count) {
     Pool *p = *pool;
@@ -265,6 +314,29 @@ static void command_memory(HyCommands *c, Pool *const *object, ptrdiff_t offset,
         hy_fail("command memory outside pool");
     hy_commands_memory(c, (uint8_t *)p->storage + offset, size);
 }
+static void command_counter(HyCommands *c, int type, uint64_t address) {
+    if (type!=0 && type!=16) hy_fail("counter type not implemented: %d",type);
+    if (address&7) hy_fail("unaligned counter destination");
+    HyCounterRecord *record=hy_commands_record(c,HY_REPORT_COUNTER,sizeof *record);
+    *record=(HyCounterRecord){address,type};
+}
+static void command_texture_pool(HyCommands *c, const DescriptorPool *pool) {
+    if (!pool->pool || pool->count<1) hy_fail("invalid recorded texture pool");
+    memcpy(hy_commands_record(c,HY_TEXTURE_POOL,sizeof *pool),pool,sizeof *pool);
+}
+static void command_sampler_pool(HyCommands *c, const DescriptorPool *pool) {
+    if (!pool->pool || pool->count<1) hy_fail("invalid recorded sampler pool");
+    memcpy(hy_commands_record(c,HY_SAMPLER_POOL,sizeof *pool),pool,sizeof *pool);
+}
+#define STATE_COMMAND(name,opcode,bytes) \
+    static void name(HyCommands *c,const void *state) { memcpy(hy_commands_record(c,opcode,bytes),state,bytes); }
+STATE_COMMAND(command_multisample,HY_MULTISAMPLE_STATE,24)
+STATE_COMMAND(command_color,HY_COLOR_STATE,4)
+STATE_COMMAND(command_blend,HY_BLEND_STATE,8)
+STATE_COMMAND(command_channels,HY_CHANNEL_MASK_STATE,4)
+STATE_COMMAND(command_polygon,HY_POLYGON_STATE,4)
+STATE_COMMAND(command_depth_stencil,HY_DEPTH_STENCIL_STATE,8)
+#undef STATE_COMMAND
 static void texture_device(TextureBuilder *b, void *d) { b->device = d; }
 static void texture_defaults(TextureBuilder *b) {
     void *d = b->device; memset(b, 0, sizeof *b); b->device = d;
@@ -300,7 +372,7 @@ static int texture_get_samples(const TextureBuilder *b) { return b->samples; }
 static nvn_texdesc texture_description(const TextureBuilder *b) {
     if (b->target != 1 || b->width < 1 || b->width > 16384 || b->height < 1 || b->height > 16384 ||
         b->depth != 1 || b->levels < 1 || b->levels > 15 || b->samples > 1 || b->samples < 0 ||
-        (b->flags & ~0x29) || ((b->flags&0x20) && (b->levels!=1 || b->has_layout || nvn_fmt_bpb(b->format,NULL,NULL)!=4)) || (b->has_layout && b->layout[0] > 5) || !nvn_fmt_bpb(b->format, NULL, NULL))
+        (b->flags & ~0x29) || ((b->flags&0x20) && (b->levels!=1 || b->has_layout || (nvn_fmt_bpb(b->format,NULL,NULL)!=4 && b->format!=0x36))) || (b->has_layout && b->layout[0] > 5) || !nvn_fmt_bpb(b->format, NULL, NULL))
         hy_fail("unsupported texture: %dx%dx%d target=%d format=%#x flags=%#x levels=%d samples=%d",
             b->width, b->height, b->depth, b->target, b->format, b->flags, b->levels, b->samples);
     return (nvn_texdesc){.target=b->target,.format=b->format,.flags=b->flags,.samples=b->samples,
@@ -447,6 +519,31 @@ static void descriptor_finalize(DescriptorPool *pool) {
     }
     memset(pool,0,sizeof *pool);
 }
+static uint32_t sampler_initialize(void **object, const void *builder) {
+    void *(*get)(const char *)=hy_symbol("nvnBootstrapLoader");
+    if (!get || !device) hy_fail("sampler initialized without SDK or Metal device");
+    HySamplerConfig config={0};
+    ((void (*)(const void *,int *,int *))get("nvnSamplerBuilderGetMinMagFilter"))(builder,&config.min_filter,&config.mag_filter);
+    ((void (*)(const void *,int *,int *,int *))get("nvnSamplerBuilderGetWrapMode"))(builder,&config.wrap[0],&config.wrap[1],&config.wrap[2]);
+    ((void (*)(const void *,float *,float *))get("nvnSamplerBuilderGetLodClamp"))(builder,&config.lod_min,&config.lod_max);
+    ((void (*)(const void *,int *,int *))get("nvnSamplerBuilderGetCompare"))(builder,&config.compare_mode,&config.compare_func);
+    ((void (*)(const void *,float *))get("nvnSamplerBuilderGetBorderColor"))(builder,config.border);
+    config.bias=((float (*)(const void *))get("nvnSamplerBuilderGetLodBias"))(builder);
+    config.anisotropy=((float (*)(const void *))get("nvnSamplerBuilderGetMaxAnisotropy"))(builder);
+    config.reduction=((int (*)(const void *))get("nvnSamplerBuilderGetReductionFilter"))(builder);
+    config.snap=((float (*)(const void *))get("nvnSamplerBuilderGetLodSnap"))(builder);
+    // Capture all SDK settings. A shader may need to implement legacy wrap modes;
+    // never replace them with an inexact Metal sampler merely to pass initialization.
+    HySampler *sampler=[HySampler new]; sampler->config=config;
+    *object=(__bridge_retained void *)sampler; return 1;
+}
+static void sampler_finalize(void **object) { id sampler=(__bridge_transfer id)*object; (void)sampler; *object=NULL; }
+static void register_sampler(const DescriptorPool *pool, int index, void *const *object) {
+    if (!*object) hy_fail("registering invalid sampler");
+    Descriptor *slot=descriptor_slot(pool,index);
+    id sampler=(__bridge id)*object, previous=(__bridge_transfer id)slot->resource; (void)previous;
+    backing_release(slot->view); slot->view=NULL; slot->resource=(__bridge_retained void *)sampler;
+}
 static void window_defaults(WindowBuilder *b) { void *d=b->device; memset(b,0,sizeof *b); b->device=d; b->interval=1; }
 static void window_device(WindowBuilder *b, void *d) { b->device=d; }
 static void window_native(WindowBuilder *b, void *native) { b->native=native; }
@@ -472,6 +569,13 @@ static uint32_t window_initialize(Window *w, const WindowBuilder *b) {
     fprintf(stderr,"NVN window: %d textures, %dx%d\n",b->count,first->builder.width,first->builder.height);
     return 1;
 }
+static void window_crop(Window *w, int x, int y, int width, int height) {
+    Texture *texture=w->builder.textures[0];
+    if (x<0 || y<0 || width<1 || height<1 || x>texture->builder.width || y>texture->builder.height ||
+        width>texture->builder.width-x || height>texture->builder.height-y) hy_fail("window crop out of range");
+    w->crop[0]=x; w->crop[1]=y; w->crop[2]=width; w->crop[3]=height;
+}
+static void window_get_crop(const Window *w, int *rectangle) { memcpy(rectangle,w->crop,sizeof w->crop); }
 static void display_initialize(void) {
     if (!device) hy_fail("display initialized before Metal");
     surface = [CAMetalLayer layer]; surface.device = device;
@@ -565,8 +669,15 @@ static void *lookup(const char *name) {
         {"nvnVertexStreamStateSetDefaults", hy_stream_defaults}, {"nvnVertexStreamStateSetStride", hy_stream_stride},
         {"nvnVertexStreamStateSetDivisor", hy_stream_divisor}, {"nvnVertexStreamStateGetStride", hy_stream_get_stride},
         {"nvnVertexStreamStateGetDivisor", hy_stream_get_divisor},
+        {"nvnBufferBuilderSetDefaults", buffer_defaults}, {"nvnBufferBuilderSetDevice", buffer_device},
+        {"nvnBufferBuilderSetStorage", buffer_storage}, {"nvnBufferInitialize", buffer_initialize},
+        {"nvnBufferFinalize", buffer_finalize}, {"nvnBufferMap", buffer_map},
+        {"nvnBufferGetAddress", buffer_address}, {"nvnBufferGetSize", buffer_size},
+        {"nvnBufferGetMemoryOffset", buffer_offset}, {"nvnBufferGetMemoryPool", buffer_pool},
+        {"nvnBufferFlushMappedRange", buffer_flush}, {"nvnBufferInvalidateMappedRange", buffer_flush},
         {"nvnTexturePoolInitialize", descriptor_initialize}, {"nvnSamplerPoolInitialize", descriptor_initialize},
-        {"nvnTexturePoolRegisterTexture", register_texture},
+        {"nvnTexturePoolRegisterTexture", register_texture}, {"nvnSamplerPoolRegisterSampler", register_sampler},
+        {"nvnSamplerInitialize", sampler_initialize}, {"nvnSamplerFinalize", sampler_finalize},
         {"nvnTexturePoolFinalize", descriptor_finalize}, {"nvnSamplerPoolFinalize", descriptor_finalize},
         {"nvnQueueBuilderSetDefaults", queue_defaults}, {"nvnQueueBuilderSetDevice", queue_device},
         {"nvnQueueBuilderSetFlags", queue_flags}, {"nvnQueueBuilderSetCommandMemorySize", queue_command_size},
@@ -577,6 +688,11 @@ static void *lookup(const char *name) {
         {"nvnSyncWait", sync_wait}, {"nvnQueueFenceSync", queue_fence}, {"nvnQueueWaitSync", queue_wait},
         {"nvnQueueFinish", queue_finish}, {"nvnQueueFinalize", queue_finalize},
         {"nvnQueueFlush", queue_finish}, // Synchronous flush until asynchronous submission is implemented.
+        {"nvnCommandBufferReportCounter", command_counter},
+        {"nvnCommandBufferSetTexturePool", command_texture_pool}, {"nvnCommandBufferSetSamplerPool", command_sampler_pool},
+        {"nvnCommandBufferBindMultisampleState", command_multisample}, {"nvnCommandBufferBindColorState", command_color},
+        {"nvnCommandBufferBindBlendState", command_blend}, {"nvnCommandBufferBindChannelMaskState", command_channels},
+        {"nvnCommandBufferBindPolygonState", command_polygon}, {"nvnCommandBufferBindDepthStencilState", command_depth_stencil},
         {"nvnCommandBufferInitialize", hy_commands_init},
         {"nvnCommandBufferSetMemoryCallback", hy_commands_callback}, {"nvnCommandBufferSetMemoryCallbackData", hy_commands_context},
         {"nvnCommandBufferAddCommandMemory", command_memory}, {"nvnCommandBufferAddControlMemory", hy_commands_control},
@@ -600,12 +716,27 @@ static void *lookup(const char *name) {
         {"nvnTextureViewSetDefaults", view_defaults}, {"nvnTextureViewSetLevels", view_levels},
         {"nvnTextureViewSetLayers", view_layers}, {"nvnTextureViewSetFormat", view_format}, {"nvnTextureViewSetTarget", view_target},
         {"nvnTextureViewSetDepthStencilMode", view_depth_mode}, {"nvnTextureViewSetSwizzle", view_swizzle},
+        {"nvnWindowSetCrop", window_crop}, {"nvnWindowGetCrop", window_get_crop},
         {"nvnWindowBuilderSetDefaults", window_defaults}, {"nvnWindowBuilderSetDevice", window_device},
         {"nvnWindowBuilderSetNativeWindow", window_native}, {"nvnWindowBuilderSetTextures", window_textures},
         {"nvnWindowBuilderSetPresentInterval", window_interval}, {"nvnWindowInitialize", window_initialize},
     };
     for (size_t i = 0; i < sizeof functions / sizeof functions[0]; i++)
         if (!strcmp(name, functions[i].name)) return functions[i].fn;
+    // These SDK objects only pack CPU render-state bits. Preserve the shipped ABI;
+    // GPU binding and drawing remain host operations and never fall through here.
+    static const char *const cpu_states[]={"nvnMultisampleState","nvnColorState","nvnBlendState",
+        "nvnChannelMaskState","nvnPolygonState","nvnDepthStencilState","nvnSamplerBuilder"};
+    for (size_t i=0;i<sizeof cpu_states/sizeof cpu_states[0];i++) {
+        size_t length=strlen(cpu_states[i]);
+        if (!strncmp(name,cpu_states[i],length) &&
+            (!strncmp(name+length,"Set",3) || !strncmp(name+length,"Get",3))) {
+            void *(*original)(const char *)=hy_symbol("nvnBootstrapLoader");
+            void *function=original ? original(name) : NULL;
+            if (!function) hy_fail("missing SDK CPU render state: %s",name);
+            return function;
+        }
+    }
     for (size_t i = 0; i < hy_nvn_name_count; i++)
         if (!strcmp(name, hy_nvn_names[i])) return hy_nvn_gates[i];
     hy_fail("unknown NVN API name: %s", name);

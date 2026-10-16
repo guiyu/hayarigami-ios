@@ -105,4 +105,3 @@ _hy_thread_enter:
     br x16
 1:  bl _hy_thread_returned
     brk #0
-

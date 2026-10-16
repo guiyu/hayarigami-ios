@@ -3,7 +3,10 @@
 #include "../runtime/runtime.h"
 #include <string.h>
 typedef struct { uint32_t op, size; } HyRecord;
-enum { HY_BEGIN = 1, HY_END, HY_JUMP };
+enum { HY_BEGIN = 1, HY_END, HY_JUMP, HY_TEXTURE_POOL, HY_SAMPLER_POOL,
+    HY_MULTISAMPLE_STATE, HY_COLOR_STATE, HY_BLEND_STATE, HY_CHANNEL_MASK_STATE,
+    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER };
+typedef struct { uint64_t address; int type; } HyCounterRecord;
 typedef struct HyCommands HyCommands;
 typedef void (*HyMemoryCallback)(HyCommands *, int, size_t, void *);
 struct HyCommands {

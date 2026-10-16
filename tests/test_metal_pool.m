@@ -8,7 +8,6 @@ _Noreturn void hy_fail(const char *format, ...) {
     va_list ap; va_start(ap, format); vfprintf(stderr, format, ap); va_end(ap); exit(42);
 }
 int main(int argc, char **argv) {
-    (void)argv;
     @autoreleasepool {
         _Alignas(8) uint8_t view_storage[40]; memset(view_storage,0xa5,sizeof view_storage);
         TextureView *bounded_view=(TextureView *)view_storage;
@@ -37,11 +36,37 @@ int main(int argc, char **argv) {
         [encoder endEncoding]; [commands commit]; [commands waitUntilCompleted];
         assert(commands.status == MTLCommandBufferStatusCompleted);
         assert(!memcmp(readback.contents, bytes + 0x1000, 0x5000));
+        BufferBuilder bb={.device=&device_object}; buffer_defaults(&bb);
+        buffer_storage(&bb,&pool,7,64); Buffer buffer; assert(buffer_initialize(&buffer,&bb));
+        assert(buffer_map(&buffer)==bytes+0x1007 && buffer_address(&buffer)==(uintptr_t)(bytes+0x1007));
+        assert(buffer_size(&buffer)==64 && buffer_offset(&buffer)==7 && buffer_pool(&buffer)==&pool);
+        if (argc>1 && !strcmp(argv[1],"--reject-buffer-range")) { buffer_flush(&buffer,31,34); return 1; }
+        if (argc>1 && !strcmp(argv[1],"--reject-live-buffer")) { pool_finalize(&pool); return 1; }
+        buffer_flush(&buffer,0,64); buffer_flush(&buffer,64,0);
+        pool->flags|=1; assert(buffer_map(&buffer)==NULL); pool->flags&=~1u;
+        buffer_finalize(&buffer); assert(!buffer.pool && !pool->buffers);
         DescriptorPool descriptors;
         assert(descriptor_initialize(&descriptors, &pool, 0, 5));
         assert(descriptors.count == 5 && descriptors.pool == pool);
         for (size_t i = 0; i < 5 * sizeof(Descriptor); i++) assert(bytes[0x1000 + i] == 0);
         assert(bytes[0x1000 + 5 * sizeof(Descriptor)] == (uint8_t)((0x1000 + 5 * sizeof(Descriptor)) * 17 + 3));
+        _Alignas(8) uint8_t command_bytes[256]; HyCommands command_state;
+        hy_commands_init(&command_state,&device_object); hy_commands_memory(&command_state,command_bytes,sizeof command_bytes);
+        hy_commands_begin(&command_state); command_texture_pool(&command_state,&descriptors);
+        command_sampler_pool(&command_state,&descriptors);
+        uint8_t sample_bits[24]; memset(sample_bits,0x69,sizeof sample_bits);
+        command_multisample(&command_state,sample_bits);
+        command_counter(&command_state,0,pool_address(&pool)+0x3000); hy_commands_end(&command_state);
+        HyRecord *pool_record=(HyRecord *)(command_bytes+8);
+        assert(pool_record->op==HY_TEXTURE_POOL && pool_record->size==32);
+        DescriptorPool *saved_pool=(DescriptorPool *)(command_bytes+16);
+        descriptors.count=3; assert(saved_pool->count==5 && saved_pool->pool==pool); descriptors.count=5;
+        assert(((HyRecord *)(command_bytes+40))->op==HY_SAMPLER_POOL);
+        assert(((HyRecord *)(command_bytes+72))->op==HY_MULTISAMPLE_STATE);
+        HyCounterRecord *counter=(HyCounterRecord *)(command_bytes+112);
+        assert(((HyRecord *)(command_bytes+104))->op==HY_REPORT_COUNTER && counter->type==0 && counter->address==pool_address(&pool)+0x3000);
+        memset(sample_bits,0,sizeof sample_bits);
+        for (unsigned i=0;i<24;i++) assert(command_bytes[80+i]==0x69);
         pool->flags |= 1; assert(pool_map(&pool) == NULL); pool->flags &= ~1u;
         QueueBuilder qb = {.device = &device_object}; queue_defaults(&qb);
         assert(qb.device == &device_object && queue_memory_size(&qb) == 0);
@@ -105,10 +130,21 @@ int main(int argc, char **argv) {
         [gpu_image getBytes:copied bytesPerRow:19*4 fromRegion:MTLRegionMake2D(0,0,19,17) mipmapLevel:0];
         for (size_t i=0;i<sizeof copied;i+=4) assert(copied[i]==255 && copied[i+1]==0 && copied[i+2]==0 && copied[i+3]==255);
         Texture alias; assert(texture_initialize(&alias,&tb)); assert(alias.image==texture.image);
+        WindowBuilder wb={.device=&device_object}; window_defaults(&wb);
+        window_native(&wb,native); Texture *window_images[]={&texture,&alias}; window_textures(&wb,2,window_images);
+        Window window; assert(window_initialize(&window,&wb)); window_crop(&window,1,2,18,15);
+        int crop[4]; window_get_crop(&window,crop); assert(!memcmp(crop,(int[]){1,2,18,15},sizeof crop));
         texture_finalize(&texture); assert(!texture.image && pool->textures->references==1);
         [(__bridge id<MTLTexture>)alias.image getBytes:copied bytesPerRow:19*4 fromRegion:MTLRegionMake2D(0,0,19,17) mipmapLevel:0];
         assert(copied[0]==255 && copied[1]==0 && copied[3]==255);
         // Keep descriptor memory separate from texture bytes.
+        HySampler *captured=[HySampler new]; captured->config=(HySamplerConfig){.min_filter=1,.mag_filter=1,
+            .wrap={2,2,2},.lod_max=16,.anisotropy=1};
+        void *sampler_object=(__bridge_retained void *)captured;
+        DescriptorPool sampler_descriptors; assert(descriptor_initialize(&sampler_descriptors,&pool,0x4800,2));
+        register_sampler(&sampler_descriptors,0,&sampler_object); sampler_finalize(&sampler_object);
+        HySampler *retained=(__bridge HySampler *)descriptor_slot(&sampler_descriptors,0)->resource;
+        assert(retained->config.wrap[0]==2); descriptor_finalize(&sampler_descriptors);
         DescriptorPool texture_descriptors; assert(descriptor_initialize(&texture_descriptors,&pool,0x4000,2));
         register_texture(&texture_descriptors,0,&alias,NULL);
         texture_finalize(&alias); assert(pool->textures && pool->textures->references==1);
@@ -136,6 +172,35 @@ int main(int argc, char **argv) {
         [gpu_image getBytes:packed_copy bytesPerRow:129*4 fromRegion:MTLRegionMake2D(0,0,129,129) mipmapLevel:0];
         assert(!memcmp(packed,packed_copy,129*129*4));
         texture_finalize(&texture); pool_finalize(&pool); free(sparse_memory); free(packed); free(packed_copy);
+        void *depth_memory=NULL; assert(!posix_memalign(&depth_memory,65536,393216));
+        pool_storage(&builder,depth_memory,393216); pool_flags(&builder,0xa1);
+        assert(pool_initialize(&pool,&builder));
+        texture_defaults(&tb); texture_size2d(&tb,129,129); texture_format(&tb,0x36);
+        texture_flags(&tb,0x28); texture_depth_mode(&tb,0); texture_storage(&tb,&pool,0);
+        assert(texture_size(&tb)==393216 && texture_initialize(&texture,&tb));
+        gpu_image=(__bridge id<MTLTexture>)texture.image;
+        pass=[MTLRenderPassDescriptor renderPassDescriptor];
+        pass.depthAttachment.texture=gpu_image; pass.depthAttachment.loadAction=MTLLoadActionClear;
+        pass.depthAttachment.storeAction=MTLStoreActionStore; pass.depthAttachment.clearDepth=0.25;
+        pass.stencilAttachment.texture=gpu_image; pass.stencilAttachment.loadAction=MTLLoadActionClear;
+        pass.stencilAttachment.storeAction=MTLStoreActionStore; pass.stencilAttachment.clearStencil=83;
+        id<MTLBuffer> depth_readback=[device newBufferWithLength:(768+256)*129 options:MTLResourceStorageModeShared];
+        assert(depth_readback); clear=[queue commandBuffer];
+        render=[clear renderCommandEncoderWithDescriptor:pass]; [render endEncoding];
+        encoder=[clear blitCommandEncoder];
+        [encoder copyFromTexture:gpu_image sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(129,129,1) toBuffer:depth_readback destinationOffset:0
+            destinationBytesPerRow:768 destinationBytesPerImage:768*129 options:MTLBlitOptionDepthFromDepthStencil];
+        [encoder copyFromTexture:gpu_image sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(129,129,1) toBuffer:depth_readback destinationOffset:768*129
+            destinationBytesPerRow:256 destinationBytesPerImage:256*129 options:MTLBlitOptionStencilFromDepthStencil];
+        [encoder endEncoding]; [clear commit]; [clear waitUntilCompleted];
+        assert(clear.status==MTLCommandBufferStatusCompleted);
+        for (unsigned y=0;y<129;y++) for (unsigned x=0;x<129;x++) {
+            assert(*(float *)((uint8_t *)depth_readback.contents+y*768+x*4)==0.25f);
+            assert(((uint8_t *)depth_readback.contents)[768*129+y*256+x]==83);
+        }
+        texture_finalize(&texture); pool_finalize(&pool); free(depth_memory);
         puts("PASS: Metal GPU copied 20480 bytes exactly; descriptor writes stayed in range; command queue completed and released");
     }
 }

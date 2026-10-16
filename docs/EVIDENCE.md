@@ -96,11 +96,13 @@ Apple AudioUnit 输出队列的合成测试覆盖左右声道、满队列拒绝�
 
 真实启动暴露第二个内存错误：旧 TextureView 宿主结构写入 36 字节，而游戏对象只留 32 字节，覆盖下一个对象的虚表。原 SDK 独立探针确认全部 view setter 保持第 32 字节之后哨兵；缩小结构后，边界测试通过，真实启动越过原崩溃并完成三缓冲窗口初始化。不能以旧参考头的对象大小替代本作 ABI 证据。
 
-原游戏进一步请求 1920×1080 RGB10A2、flags=0x28 的稀疏布局。独立调用原 SDK 的纯 CPU 布局函数（不初始化或伪造设备）对照 10 组尺寸与瓦片参数，包括 1×1、19×16、128 边界两侧、129×129、1920×1080。当前只实现二维单层、4 字节像素、无显式 packaged layout 的稀疏布局；完整稀疏瓦片为 128×128 像素/64 KiB，小图落入普通 mip tail。129×129 占 262,144 字节，1920×1080 占 8,847,360 字节；跨瓦片行的偏移通过独立黄金值测试。129×129 RGB10A2 数据已完成真实 Metal 上传和逐字节读回；真实启动也已创建本作 1920×1080 RGB10A2 纹理。Metal 使用完整驻留图像；虚拟 pool、动态稀疏映射及多级稀疏纹理仍明确拒绝，不能称为完整 sparse API 支持。
+原游戏进一步请求 1920×1080 RGB10A2、flags=0x28 的稀疏布局。独立调用原 SDK 的纯 CPU 布局函数（不初始化或伪造设备）对照 4/8 字节像素共 20 组尺寸与瓦片参数，包括 1×1、19×16、128 边界两侧、129×129、1920×1080。当前只实现二维单层、4 字节像素或 8 字节深度/模板、无显式 packaged layout 的稀疏布局；完整稀疏瓦片为 64 KiB：4 字节像素为 128×128，8 字节为 128×64，小图落入普通 mip tail。129×129 占 262,144 字节，1920×1080 占 8,847,360 字节；跨瓦片行的偏移通过独立黄金值测试。129×129 RGB10A2 数据已完成真实 Metal 上传和逐字节读回；真实启动也已创建本作 1920×1080 RGB10A2 和 Depth32Float/Stencil8 纹理，后者占 16,711,680 字节。129×129 深度/模板图经真实 GPU 清屏后，所有像素读回深度 0.25、模板 83。Metal 使用完整驻留图像；虚拟 pool、动态稀疏映射及多级稀疏纹理仍明确拒绝，不能称为完整 sparse API 支持。
 
 命令录制目前验证记录快照、内存耗尽回调、跨段跳转和旧 handle 保持；尚未完成绘图命令重放。GPU 同步以实际 Metal command buffer 完成状态为依据，测试用 shared event 阻塞 GPU，验证零等待/有限等待超时、解除阻塞后完成及已完成状态。队列间等待通过每代 fence 独立的 Metal shared event 排队，不阻塞 CPU；双队列测试曾复现 CPU 等待造成的进度阻塞，现覆盖该回归。flush 暂同步完成；不是性能验收。
 
 显示事件目前为 headless 60 Hz 单调时钟，不是物理屏幕 VSync。CAMetalLayer 为 BGRA8，后续呈现需要从游戏 RGBA 目标采样转换。着色器翻译、绘图、真实标题画面、触控、存档、影片及生命周期仍未完成。iOS arm64 静态库编译通过只证明编译，未生成 App/IPA、未签名、未安装。
+
+GPU buffer 使用现有 pool 的确定子区间，支持 CPU 映射与地址、相对范围 flush/invalidate，拒绝越界及存活 buffer 对应 pool 提前释放。窗口 crop 保存并验证纹理范围，仍待后续呈现路径使用。
 
 统一回归入口 scripts/check_native.sh 已通过 ASan/UBSan、线程与音频 TSan、内存保护、真实 Metal 与原生 ARM64 fixture 检查；独立审查发现的 backing 生命周期和有效布局问题已修复并复审通过。
 
@@ -109,3 +111,13 @@ Apple AudioUnit 输出队列的合成测试覆盖左右声道、满队列拒绝�
 Xcode 26.3（17C529）、iPhoneOS SDK 26.2、LLVM 22；Python 包精确版本见 requirements.txt。程序分析使用 cryptography、lz4；改写/验证使用 capstone、unicorn。参考源码路径和工具摘要记录于本地 `.local/audit.json`。
 
 容器格式依据 [hactool NCA 定义](https://github.com/SciresM/hactool/blob/master/nca.h)、[区段与密钥处理实现](https://github.com/SciresM/hactool/blob/master/nca.c)、[RomFS 定义](https://github.com/SciresM/hactool/blob/master/ivfc.h) 和 [XTS 扇区处理](https://github.com/SciresM/hactool/blob/master/aes.c) 交叉核对。没有下载游戏源码、游戏内容或外部密钥。
+
+## 状态与采样器验证增量
+
+Buffer 映射与地址保留 pool 内偏移；flush 在子范围内验证，仍有 live buffer 时拒绝销毁 pool。窗口 crop 保留请求矩形并检查边界。测试覆盖两类拒绝路径和真实子区间映射。
+
+六类纯 CPU render-state 对象和 SamplerBuilder 的 Set/Get 直接保留原 SDK 实现；独立探针验证对象边界及参数往返。CommandBuffer 绑定保存状态和 descriptor-pool 快照；timestamp counter 目前仅录制请求，尚无执行结果，不能当作 GPU 计时完成。
+
+采样器保存完整不可变参数，由 ARC holder 随描述符持有；实际绘制绑定时才创建 Metal sampler。合成 GPU 测试已验证双线性插值、重复、边缘钳制和透明边框。游戏初始化请求的 wrap=2 镜像钳制尚无直接 Metal 等价实现，保留原始值；实际使用时必须转换或明确失败，不得替换成默认采样。
+
+最新完整 native 回归、真实 Metal 测试及 iOS arm64 编译检查通过；原始游戏启动推进至 nvnProgramInitialize。尚未执行游戏着色器、提交游戏绘图或产出可安装 App/IPA。

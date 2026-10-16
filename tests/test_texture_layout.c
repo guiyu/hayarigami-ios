@@ -36,6 +36,13 @@ int main(void) {
         d.width=widths[k]; d.height=heights[k]; nvn_tex_layout(&d,&layout);
         assert(layout.size==expected[k]);
     }
+    const uint64_t depth_expected[]={512,3072,131072,131072,131072,131072,131072,393216,16711680,983040};
+    d.format=0x36;
+    for (unsigned k=0;k<10;k++) {
+        d.width=widths[k]; d.height=heights[k]; nvn_tex_layout(&d,&layout);
+        assert(layout.size==depth_expected[k]);
+    }
+    d.format=0x3d;
     d.width=d.height=129; nvn_tex_layout(&d,&layout);
     storage=calloc(1,layout.size); uint8_t *source=malloc(129*129*4), *dest=malloc(129*129*4);
     assert(storage && source && dest);

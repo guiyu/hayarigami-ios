@@ -89,9 +89,9 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     shape(d, &dpl, &layered, &w, &h, &z);
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     o->bpb = t.bpb; o->tileW = o->tileH = o->tileD = 0; o->layers = layered ? z : 1;
-    // Sparse support is deliberately limited to the observed single-level 2D, 4-byte layout.
+    // Sparse support is deliberately limited to the observed single-level 2D, 4/8-byte layouts.
     if ((d->flags & 0x20) && (d->target!=1 || d->levels!=1 || d->depth!=1 ||
-        d->samples>1 || t.bpb!=4 || t.bw!=1 || t.bh!=1 || d->pkg_block_h)) {
+        d->samples>1 || (t.bpb!=4 && t.bpb!=8) || t.bw!=1 || t.bh!=1 || d->pkg_block_h)) {
         o->size=o->layer_size=0; o->align=0; return;
     }
     if (!t.bpb) { o->size = 0; o->align = 512; o->layer_size = 0; return; }
@@ -108,10 +108,13 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     unsigned tileH = 0, tileD = 0;
     if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
-    // Original SDK 55.15 CPU layout: full sparse tiles are 128x128 pixels (64 KiB).
+    // Original SDK 55.15 CPU layout: full sparse tiles are 64 KiB: 128x128 at 4 Bpp, 128x64 at 8 Bpp.
     // A small single-level texture stays in the ordinary block-linear mip tail.
     unsigned tileW=0;
-    if ((d->flags & 0x20) && w>=128 && h>=128) { tileW=3; tileH=4; }
+    unsigned sparseHeight=t.bpb==8 ? 64 : 128;
+    if ((d->flags & 0x20) && w>=128 && h>=sparseHeight) {
+        tileW=t.bpb==8 ? 4 : 3; tileH=t.bpb==8 ? 3 : 4;
+    }
     o->tileW=tileW; o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;
     uint64_t ls = level_offset(d, levels, dpl, w, h, z, tileW, tileH, tileD, t);

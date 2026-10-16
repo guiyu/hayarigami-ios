@@ -2,7 +2,7 @@
 
 `src/runtime/gate.S` 改编自 D2R Mobile 的通用寄存器门和线程入口；MIT 许可见 D2R-Mobile-LICENSE。
 
-`src/gfx/nvn_tex.{c,h}` 与 `nvn_deswizzle.{c,h}` 来自同一工程的通用 Tegra 块线性布局组件，仅读取复制这些文件，没有引入该游戏的 shader facts、规则、地址表或渲染旁路。`nvn_deswizzle.h` 的相对 include 路径已修改；布局与搬运新增本作 SDK 对照过的单层、4 字节像素稀疏瓦片宽度支持。布局算法是该工程对 deko3d 的改编，并非原版 deko3d；其 zlib 许可见 deko3d-LICENSE。原始公开来源：<https://github.com/devkitPro/deko3d/blob/master/source/dk_image.cpp>。
+`src/gfx/nvn_tex.{c,h}` 与 `nvn_deswizzle.{c,h}` 来自同一工程的通用 Tegra 块线性布局组件，仅读取复制这些文件，没有引入该游戏的 shader facts、规则、地址表或渲染旁路。`nvn_deswizzle.h` 的相对 include 路径已修改；布局与搬运新增本作 SDK 对照过的单层、4/8 字节像素稀疏瓦片宽度支持。布局算法是该工程对 deko3d 的改编，并非原版 deko3d；其 zlib 许可见 deko3d-LICENSE。原始公开来源：<https://github.com/devkitPro/deko3d/blob/master/source/dk_image.cpp>。
 
 复制时 SHA-256（修改 include 前）：
 

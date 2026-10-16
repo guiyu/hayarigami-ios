@@ -54,5 +54,19 @@ else
     test "$check_rc" -eq 42
     rg -q 'unsupported overlapping texture layouts' "$OUT/metal-reject.log"
 fi
+for rejected in buffer-range live-buffer; do
+    if "$OUT/metal" "--reject-$rejected" > "$OUT/metal-$rejected.log" 2>&1; then
+        echo "FAIL: invalid $rejected accepted" >&2; exit 1
+    else
+        check_rc=$?; test "$check_rc" -eq 42
+        case "$rejected" in
+            buffer-range) rg -q 'buffer flush out of range' "$OUT/metal-$rejected.log" ;;
+            live-buffer) rg -q 'memory pool finalized with live resources' "$OUT/metal-$rejected.log" ;;
+        esac
+    fi
+done
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_metal_sampler.m \
+    -framework Metal -framework Foundation -o "$OUT/sampler"
+"$OUT/sampler"
 sh tests/test_runtime.sh
 echo 'PASS: native synthetic regressions, sanitizer checks and real Metal checks'
