@@ -71,3 +71,30 @@ sh scripts/build_resource_reader.sh
 5. 安装后分别记录：能启动、真实标题画面、进入剧情、选项/音频/影片、保存退出与恢复、后台恢复及持续运行。没有完成的项目标为未验证。
 
 Personal Team 可用性和实际签名期限以到时 Xcode 返回结果为准；本次未创建签名、未检查设备、未安装。
+## 原生运行时增量复跑
+
+在仓库根目录执行（所有输出仍在 `.local/`）：
+
+```sh
+sh scripts/build_runtime.sh
+sh scripts/check_native.sh
+sh scripts/build_audio_probe.sh
+.local/runtime/probe-audio .local/repro-rewrite
+.local/runtime/probe-audio .local/repro-rewrite --six-channels
+sh scripts/build_nvn_probe.sh
+.local/runtime/probe-nvn .local/repro-rewrite
+sh scripts/check_ios_compile.sh
+.local/runtime/hayarigami-host .local/repro-rewrite --boot .local/romfs
+```
+
+执行真实 ARM64 映射需允许本地原生代码执行的环境；沙箱中 SIGILL 不应当作游戏故障或通过。最后一条是诊断启动，未实现的平台调用会退出 42，不是游戏可玩验收。iOS 编译脚本只产出静态库，不生成 App/IPA。
+
+音频对照需安装 requirements.txt，并在工作目录单独构建 vgmstream CLI（关闭不需要的可选解码器）。传入其绝对路径：
+
+```sh
+python scripts/verify_audio.py --romfs .local/romfs \
+  --library .local/runtime/libdsp_adpcm.dylib \
+  --reference /absolute/path/to/vgmstream-cli --out .local/audio-check-new
+```
+
+输出目录必须新建且位于 `.local/`。测试临时音频仅本地使用，成功后删除，保留摘要 JSON；失败目录供诊断，不作为可发布产物。
