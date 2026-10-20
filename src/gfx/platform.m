@@ -12,6 +12,7 @@
 #include "shader.h"
 #include "bc7.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <TargetConditionals.h>
 #include "nvn_deswizzle.h"
 extern const char *const hy_nvn_names[];
 extern void *const hy_nvn_gates[];
@@ -26,14 +27,24 @@ static void *vsync_event, *resolution_event;
 static uint64_t next_tick;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t display_changed = PTHREAD_COND_INITIALIZER;
+static int app_active=1;
+static void graphics_wait_active(void) {
+    pthread_mutex_lock(&display_lock);while(!app_active)pthread_cond_wait(&display_changed,&display_lock);pthread_mutex_unlock(&display_lock);
+}
+void hy_graphics_set_active(int active) {
+    pthread_mutex_lock(&display_lock);app_active=!!active;pthread_cond_broadcast(&display_changed);pthread_mutex_unlock(&display_lock);
+}
 typedef struct { void *device, *storage; size_t size; uint32_t flags; } PoolBuilder;
 typedef struct Pool {
     void *storage, *buffer; size_t size, offset; uint32_t flags;
     struct TextureBacking *textures; unsigned buffers; pthread_mutex_t lock;
     struct Pool *next;
 } Pool;
+static void replay_release_pool(Pool *pool);
+static void replay_release_queue(void *queue_object);
 static Pool *pools;
 static pthread_mutex_t pools_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t descriptors_lock=PTHREAD_MUTEX_INITIALIZER;
 // Descriptors are host references, never Maxwell descriptor words.
 typedef struct { void *resource; void *view; } Descriptor;
 typedef struct { Pool *pool; size_t offset; int count; } DescriptorPool;
@@ -48,20 +59,20 @@ typedef struct {
     void *device;
     int flags, target, width, height, depth, levels, format, samples;
     Pool **pool; ptrdiff_t offset, stride;
-    uint16_t layout; int has_layout;
+    uint16_t layout; int has_layout; uint8_t swizzle[4],has_swizzle;
 } TextureBuilder;
 _Static_assert(sizeof(TextureBuilder) <= 128, "NVN texture builder size");
 typedef struct TextureBacking {
     struct TextureBacking *next; Pool *pool;
-    size_t offset, size; int width, height, levels, format; unsigned tile_width, tile_height;
-    unsigned references; void *image;
+    size_t offset, size; int width, height, levels, format; unsigned tile_width, tile_height; uint32_t flags,stride;
+    unsigned references,objects; void *image;
 } TextureBacking;
 typedef struct { TextureBuilder builder; void *image; TextureBacking *backing; } Texture;
 _Static_assert(sizeof(Texture) <= 128, "NVN texture ABI size");
-typedef struct { int level, levels, layer, layers, format, target; uint8_t fields, depth_mode, swizzle[4]; } TextureView;
+typedef struct { uint8_t level,levels;uint16_t layer,layers,format;uint8_t target,fields,depth_mode,swizzle[4]; } TextureView;
 typedef struct { void *device, *native; int count, interval; Texture *textures[4]; } WindowBuilder;
-typedef struct { WindowBuilder builder; int next, crop[4]; } Window;
-_Static_assert(sizeof(TextureView) <= 32 && sizeof(WindowBuilder) <= 64 && sizeof(Window) <= 384, "NVN view/window ABI sizes");
+typedef struct { WindowBuilder builder; int next, crop[4]; uint8_t acquired[4]; uint64_t frames; } Window;
+_Static_assert(sizeof(TextureView) == 16 && sizeof(WindowBuilder) <= 64 && sizeof(Window) <= 384, "NVN view/window ABI sizes");
 @interface HySampler : NSObject {
 @public
     HySamplerConfig config;
@@ -129,7 +140,7 @@ static void set_origin(void *object, int mode) {
 static void integer(const void *object, unsigned query, int *out) {
     (void)object;
     if (query == 0xf || query == 0x10) { *out = sizeof(Descriptor); return; }
-    if (query == 0x11 || query == 0x12) { *out = 0; return; } // No host-reserved descriptors.
+    if (query == 0x11 || query == 0x12) { *out=256; return; } // Preserve the title SDK reserved descriptor range.
     if (query == 0x24 || query == 0x25) { *out = DESCRIPTOR_LIMIT; return; }
     // Metal queues allocate command/control/compute storage internally.
     if (query == 0x51 || query == 0x52 || query == 0x54 || query == 0x55 ||
@@ -236,6 +247,7 @@ static void pool_finalize(Pool **object) {
     Pool *p = *object;
     if (!p) hy_fail("invalid NVN memory pool finalize");
     command_release_pool(p);
+    replay_release_pool(p);
     if (p->textures || p->buffers) hy_fail("memory pool finalized with live resources");
     pthread_mutex_lock(&pools_lock);
     Pool **slot=&pools; while (*slot && *slot!=p) slot=&(*slot)->next;
@@ -252,10 +264,12 @@ static void *pool_map(Pool *const *object) { return ((*object)->flags & 1) ? NUL
 static uint64_t pool_address(Pool *const *object) { return (uintptr_t)(*object)->storage; }
 static size_t pool_size(Pool *const *object) { return (*object)->size; }
 static uint32_t pool_get_flags(Pool *const *object) { return (*object)->flags; }
+static void refresh_linear_pool(Pool *pool,size_t offset,size_t size);
 static void pool_flush(Pool *const *object, ptrdiff_t offset, size_t size) {
     Pool *p = *object;
     if (offset < 0 || (size_t)offset > p->size || size > p->size - (size_t)offset) hy_fail("NVN pool flush out of bounds");
     sys_dcache_flush((uint8_t *)p->storage + offset, size);
+    refresh_linear_pool(p,(size_t)offset,size);
 }
 static NSData *pool_copy(uint64_t address,size_t size) {
     NSData *result=nil;
@@ -300,7 +314,7 @@ id<MTLFunction> hy_metal_shader(HyShader *shader,NSString *root,int alpha,float 
     NSString *base=[directory stringByAppendingPathComponent:@(shader->key)];
     NSData *json=[NSData dataWithContentsOfFile:[base stringByAppendingString:@".json"]];NSError *error=nil;
     id parsed=json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:&error] : nil;
-    if(![parsed isKindOfClass:NSDictionary.class]) hy_fail("Metal shader metadata unavailable or malformed");
+    if(![parsed isKindOfClass:NSDictionary.class]) hy_fail("Metal shader metadata unavailable or malformed: %s",base.fileSystemRepresentation);
     NSDictionary *metadata=parsed;
     if(![metadata[@"Profile"] isEqual:@"float-2d-upper-left-zero-one-v1"] ||
        ![metadata[@"Stage"] isEqual:@(shader->stage)] || ![metadata[@"AlphaTestFunction"] isEqual:@(alpha)] ||
@@ -431,6 +445,7 @@ static uint32_t queue_initialize(void **object, const QueueBuilder *b) {
     return 1;
 }
 static void queue_finish(void *const *object) {
+    graphics_wait_active();
     id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)*object;
     id<MTLCommandBuffer> fence = [q commandBuffer];
     [fence commit]; [fence waitUntilCompleted];
@@ -438,6 +453,7 @@ static void queue_finish(void *const *object) {
 }
 static void queue_finalize(void **object) {
     queue_finish(object);
+    replay_release_queue(*object);
     id q = (__bridge_transfer id)*object; (void)q; *object = NULL;
 }
 // The guest sync object stores one host pointer. Metal owns submitted command buffers.
@@ -475,6 +491,7 @@ static void command_fence(HyCommands *c,GpuSync *const *object,int condition,int
     memcpy(record,&value,sizeof value);command_keep(record,sizeof value,fence);
 }
 static void queue_fence(void *const *object, GpuSync **sync_object, int condition, int flags) {
+    graphics_wait_active();
     if (condition<0 || condition>1 || (flags&~1)) hy_fail("unsupported sync condition/flags");
     GpuSync *sync=*sync_object; if (!sync) hy_fail("invalid queue fence sync");
     id<MTLCommandBuffer> command=[(__bridge id<MTLCommandQueue>)*object commandBuffer];
@@ -567,19 +584,22 @@ static void command_vertex_buffers(HyCommands *c,int first,int count,const HyGpu
     for (int i=0;i<count;i++) command_bind_buffer(c,HY_VERTEX_BUFFER,-1,first+i,ranges[i].address,ranges[i].size);
 }
 @interface HyDrawIndexed : NSObject <HyPoolReference> {
-@public HyBoundBuffer *indices; int primitive,index_type,count;
+@public HyBoundBuffer *indices; int primitive,index_type,count,base_vertex;
 }
 @end
 @implementation HyDrawIndexed
 - (BOOL)usesPool:(Pool *)pool { return [indices usesPool:pool]; }
 @end
-static void command_draw_elements(HyCommands *c,int primitive,int type,int count,uint64_t address) {
+static void command_draw_elements_base(HyCommands *c,int primitive,int type,int count,uint64_t address,int base) {
     if (primitive<0 || primitive>14 || type<0 || type>2 || count<0 || (count && (address&((1u<<type)-1))))
         hy_fail("unsupported indexed draw parameters");
-    HyDrawIndexed *draw=[HyDrawIndexed new];draw->primitive=primitive;draw->index_type=type;draw->count=count;
+    HyDrawIndexed *draw=[HyDrawIndexed new];draw->primitive=primitive;draw->index_type=type;draw->count=count;draw->base_vertex=base;
     draw->indices=bound_buffer(-2,0,address,(size_t)count<<type);
     void *value=(__bridge void *)draw;void *record=hy_commands_record(c,HY_DRAW_ELEMENTS,sizeof value);
     memcpy(record,&value,sizeof value);command_keep(record,sizeof value,draw);
+}
+static void command_draw_elements(HyCommands *c,int primitive,int type,int count,uint64_t address) {
+    command_draw_elements_base(c,primitive,type,count,address,0);
 }
 static void command_program(HyCommands *c,void *const *object,uint32_t stages) {
     if ((stages&~63u) || (object && !*object)) hy_fail("invalid bound program/stages");
@@ -616,6 +636,9 @@ static void texture_defaults(TextureBuilder *b) {
     void *d = b->device; memset(b, 0, sizeof *b); b->device = d;
     b->target = 1; b->width = b->height = b->depth = b->levels = 1;
 }
+static void texture_swizzle(TextureBuilder *builder,int r,int g,int b,int a) {
+    int channels[]={r,g,b,a};for(unsigned i=0;i<4;i++){if(channels[i]<0 || channels[i]>5)hy_fail("invalid texture builder swizzle");builder->swizzle[i]=(uint8_t)channels[i];}builder->has_swizzle=1;
+}
 static void texture_flags(TextureBuilder *b, int v) { b->flags = v; }
 static void texture_target(TextureBuilder *b, int v) { b->target = v; }
 static void texture_width(TextureBuilder *b, int v) { b->width = v; }
@@ -650,14 +673,15 @@ static nvn_texdesc texture_description(const TextureBuilder *b) {
     int bytes_per_block=nvn_fmt_bpb(b->format,NULL,NULL);
     if (b->target != 1 || b->width < 1 || b->width > 16384 || b->height < 1 || b->height > 16384 ||
         b->depth != 1 || b->levels < 1 || b->levels > 15 || b->samples > 1 || b->samples < 0 ||
-        (b->flags & ~0x29) || ((b->flags&0x20) && (b->levels!=1 ||
+        (b->flags & ~0x39) || ((b->flags&0x20) && (b->levels!=1 ||
         (bytes_per_block!=1 && bytes_per_block!=2 && bytes_per_block!=4 && bytes_per_block!=8 && bytes_per_block!=16))) ||
         (b->has_layout && ((b->layout&15)>5 || (b->layout&0xf0) || (b->layout>>8)>5 ||
         ((b->layout>>8) && b->levels>1))) || !bytes_per_block)
         hy_fail("unsupported texture: %dx%dx%d target=%d format=%#x flags=%#x levels=%d samples=%d packaged=%d layout=%#x",
             b->width,b->height,b->depth,b->target,b->format,b->flags,b->levels,b->samples,b->has_layout,
             b->layout);
-    return (nvn_texdesc){.target=b->target,.format=b->format,.flags=b->flags,.samples=b->samples,
+    if((b->flags&0x10) && ((b->format!=1 && b->format!=0xd) || b->levels!=1 || b->has_layout || (b->flags&0x20) || b->stride<0 || (uint64_t)b->stride>UINT32_MAX || (b->stride && (b->stride<(ptrdiff_t)b->width*bytes_per_block || (b->stride&31)))))hy_fail("unsupported linear texture layout: %dx%d format=%#x flags=%#x stride=%td levels=%d packaged=%d",b->width,b->height,b->format,b->flags,b->stride,b->levels,b->has_layout);
+    return (nvn_texdesc){.stride=(uint32_t)b->stride,.target=b->target,.format=b->format,.flags=b->flags,.samples=b->samples,
         .width=b->width,.height=b->height,.depth=b->depth,.levels=b->levels,
         .pkg_block_h=b->has_layout ? (b->layout&15)+1 : 0,
         .pkg_block_w=b->has_layout ? (b->layout>>8)+1 : 0};
@@ -683,6 +707,7 @@ static void texture_sparse_tiles(const TextureBuilder *b,uint32_t *out) {
 static MTLPixelFormat texture_metal_format(int format) {
     switch (format) {
     case 0x1: return MTLPixelFormatR8Unorm;
+    case 0xd: return MTLPixelFormatRG8Unorm;
     case 0x25: return MTLPixelFormatRGBA8Unorm;
     case 0x3d: return MTLPixelFormatRGB10A2Unorm;
     case 0x3f: return MTLPixelFormatRG11B10Float;
@@ -707,9 +732,15 @@ static uint32_t texture_initialize(Texture *t, const TextureBuilder *b) {
     for (TextureBacking *backing=pool->textures;backing;backing=backing->next) {
         if ((size_t)b->offset >= backing->offset+backing->size || backing->offset >= (size_t)b->offset+bytes) continue;
         if ((size_t)b->offset!=backing->offset || bytes!=backing->size || b->width!=backing->width ||
-            b->height!=backing->height || b->levels!=backing->levels || b->format!=backing->format || layout.tileH!=backing->tile_height || layout.tileW!=backing->tile_width)
-            hy_fail("unsupported overlapping texture layouts");
-        backing->references++;
+            b->height!=backing->height || b->levels!=backing->levels || b->format!=backing->format || layout.tileH!=backing->tile_height || layout.tileW!=backing->tile_width || (b->flags&0x10)!=(backing->flags&0x10) || d.stride!=backing->stride)
+            {
+                // A live movie descriptor may outlast its CPU allocation. The title
+                // reuses those bytes for a packaged, sampled-only BC7 image.
+                // Keep each interpretation in a separate Metal image; linear reads
+                // refresh from CPU storage when sampled. GPU-written aliases remain unsupported.
+                if(!backing->objects || ((backing->flags&0x10) && (b->format==0x4d || b->format==0x4e)))continue;
+                hy_fail("unsupported overlapping texture layouts: new=%dx%d/%#x old=%dx%d/%#x objects=%u refs=%u",b->width,b->height,b->format,backing->width,backing->height,backing->format,backing->objects,backing->references);}
+        backing->references++;backing->objects++;
         *t=(Texture){.builder=*b,.image=backing->image,.backing=backing};
         pthread_mutex_unlock(&pool->lock);
         fputs("NVN texture alias shares existing Metal image\n",stderr);
@@ -719,12 +750,13 @@ static uint32_t texture_initialize(Texture *t, const TextureBuilder *b) {
         width:b->width height:b->height mipmapped:b->levels > 1];
     desc.mipmapLevelCount = b->levels; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
     int bc7=b->format==0x4d || b->format==0x4e;
+    if (b->flags&0x10)desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
     if (bc7) desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
     int depth = b->format == 0x34 || b->format == 0x36;
     desc.storageMode = depth ? MTLStorageModePrivate : MTLStorageModeShared;
-    id<MTLTexture> image = [device newTextureWithDescriptor:desc];
+    id<MTLTexture> image=[device newTextureWithDescriptor:desc];
     if (!image) { pthread_mutex_unlock(&pool->lock); return 0; }
-    if (!depth && !(b->flags & 1)) {
+    if (!depth && !(b->flags & (1|0x10))) {
         void *storage = (uint8_t *)(*b->pool)->storage + b->offset;
         for (int level = 0; level < b->levels; level++) {
             size_t w = b->width >> level, h = b->height >> level; if (!w) w=1; if (!h) h=1;
@@ -745,14 +777,27 @@ static uint32_t texture_initialize(Texture *t, const TextureBuilder *b) {
     }
     TextureBacking *backing=calloc(1,sizeof *backing);
     if (!backing) hy_fail("texture backing allocation");
-    *backing=(TextureBacking){.next=pool->textures,.pool=pool,.offset=b->offset,.size=bytes,.tile_height=layout.tileH,.tile_width=layout.tileW,
-        .width=b->width,.height=b->height,.levels=b->levels,.format=b->format,.references=1,
+    *backing=(TextureBacking){.next=pool->textures,.pool=pool,.offset=b->offset,.size=bytes,.tile_height=layout.tileH,.tile_width=layout.tileW,.flags=b->flags,.stride=d.stride,
+        .width=b->width,.height=b->height,.levels=b->levels,.format=b->format,.references=1,.objects=1,
         .image=(__bridge_retained void *)image};
     pool->textures=backing;
     *t = (Texture){.builder=*b,.image=backing->image,.backing=backing};
     pthread_mutex_unlock(&pool->lock);
     fprintf(stderr, "NVN Metal texture: %dx%d format=%#x levels=%d bytes=%zu\n", b->width,b->height,b->format,b->levels,bytes);
     return 1;
+}
+static void refresh_linear_locked(TextureBacking *backing) {
+    if(!(backing->flags&0x10))return;
+    NSUInteger bpp=(NSUInteger)nvn_fmt_bpb(backing->format,NULL,NULL);
+    NSUInteger pitch=backing->stride ? backing->stride : ((NSUInteger)backing->width*bpp+31)&~(NSUInteger)31;
+    id<MTLTexture> image=(__bridge id<MTLTexture>)backing->image;
+    [image replaceRegion:MTLRegionMake2D(0,0,(NSUInteger)backing->width,(NSUInteger)backing->height) mipmapLevel:0
+        withBytes:(uint8_t *)backing->pool->storage+backing->offset bytesPerRow:pitch];
+}
+static void refresh_linear_pool(Pool *pool,size_t offset,size_t size) {
+    pthread_mutex_lock(&pool->lock);
+    for(TextureBacking *b=pool->textures;b;b=b->next)if(offset<b->offset+b->size && b->offset<offset+size)refresh_linear_locked(b);
+    pthread_mutex_unlock(&pool->lock);
 }
 static void backing_release(TextureBacking *backing) {
     if (!backing) return;
@@ -770,6 +815,9 @@ static void backing_release(TextureBacking *backing) {
 }
 static void texture_finalize(Texture *t) {
     if (!t->backing) hy_fail("invalid texture finalize");
+    pthread_mutex_lock(&t->backing->pool->lock);
+    if(!t->backing->objects)hy_fail("invalid texture object ownership");
+    t->backing->objects--;pthread_mutex_unlock(&t->backing->pool->lock);
     backing_release(t->backing); memset(t, 0, sizeof *t);
 }
 static int texture_width_value(const Texture *t) { return t->builder.width; }
@@ -779,10 +827,10 @@ static void texture_label(Texture *t, const char *label) {
     image.label=label ? [NSString stringWithUTF8String:label] : nil;
 }
 static void view_defaults(TextureView *v) { memset(v, 0, sizeof *v); }
-static void view_levels(TextureView *v, int first, int count) { v->fields |= 1; v->level=first; v->levels=count; }
-static void view_layers(TextureView *v, int first, int count) { v->fields |= 2; v->layer=first; v->layers=count; }
-static void view_format(TextureView *v, int format) { v->fields |= 4; v->format=format; }
-static void view_target(TextureView *v, int target) { v->fields |= 8; v->target=target; }
+static void view_levels(TextureView *v, int first, int count) { if(first<0 || first>255 || count<0 || count>255)hy_fail("invalid view mip range");v->fields |= 1; v->level=first; v->levels=count; }
+static void view_layers(TextureView *v, int first, int count) { if(first<0 || first>65535 || count<0 || count>65535)hy_fail("invalid view layer range");v->fields |= 2; v->layer=first; v->layers=count; }
+static void view_format(TextureView *v, int format) { if(format<0 || format>65535)hy_fail("invalid view format");v->fields |= 4; v->format=format; }
+static void view_target(TextureView *v, int target) { if(target<0 || target>255)hy_fail("invalid view target");v->fields |= 8; v->target=target; }
 static void view_depth_mode(TextureView *v, int mode) { if (mode<0 || mode>1) hy_fail("invalid texture depth/stencil mode"); v->fields |= 16; v->depth_mode=(uint8_t)mode; }
 static void view_swizzle(TextureView *v, int r, int g, int b, int a) {
     int channels[]={r,g,b,a};
@@ -799,33 +847,35 @@ static Descriptor *descriptor_slot(const DescriptorPool *pool, int index) {
 static id<MTLTexture> texture_view(const Texture *t,const TextureView *view) {
     if (!t || !t->image) hy_fail("registering invalid texture");
     id<MTLTexture> image=(__bridge id<MTLTexture>)t->image;
+    int first=0,count=t->builder.levels;MTLPixelFormat format=image.pixelFormat;
+    const uint8_t identity[]={2,3,4,5};const uint8_t *swizzle=t->builder.has_swizzle ? t->builder.swizzle : identity;
     if (view) {
-        if (((view->fields&2) && (view->layer || view->layers<0 || view->layers>1)) ||
-            ((view->fields&8) && view->target!=1) || ((view->fields&16) && view->depth_mode!=0) ||
-            ((view->fields&32) && memcmp(view->swizzle,(uint8_t[]){2,3,4,5},4)))
-            hy_fail("unsupported texture view channels/layers");
-        int first=(view->fields&1) ? view->level : 0;
-        int count=(view->fields&1) && view->levels ? view->levels : t->builder.levels-first;
-        if (first<0 || count<1 || first>=t->builder.levels || count>t->builder.levels-first)
-            hy_fail("texture view mip range");
-        MTLPixelFormat format=(view->fields&4) ? texture_metal_format(view->format) : image.pixelFormat;
-        if (first || count!=t->builder.levels || format!=image.pixelFormat) {
-            image=[image newTextureViewWithPixelFormat:format textureType:MTLTextureType2D
-                levels:NSMakeRange(first,count) slices:NSMakeRange(0,1)];
-            if (!image) hy_fail("Metal texture view creation failed");
-        }
+        if (((view->fields&2) && (view->layer || view->layers>1)) ||
+            ((view->fields&8) && view->target!=1) || ((view->fields&16) && view->depth_mode!=0))hy_fail("unsupported texture view layers/depth");
+        first=(view->fields&1) ? view->level : 0;
+        count=(view->fields&1) && view->levels ? view->levels : t->builder.levels-first;
+        if(first<0 || count<1 || first>=t->builder.levels || count>t->builder.levels-first)hy_fail("texture view mip range");
+        format=(view->fields&4) ? texture_metal_format(view->format) : image.pixelFormat;
+        if(view->fields&32)swizzle=view->swizzle;
+    }
+    if(first || count!=t->builder.levels || format!=image.pixelFormat || memcmp(swizzle,identity,4)) {
+        const MTLTextureSwizzle channels[]={MTLTextureSwizzleZero,MTLTextureSwizzleOne,MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha};
+        image=[image newTextureViewWithPixelFormat:format textureType:MTLTextureType2D levels:NSMakeRange(first,count) slices:NSMakeRange(0,1)
+            swizzle:MTLTextureSwizzleChannelsMake(channels[swizzle[0]],channels[swizzle[1]],channels[swizzle[2]],channels[swizzle[3]])];
+        if(!image)hy_fail("Metal texture view creation failed");
     }
     return image;
 }
 static void register_texture(const DescriptorPool *pool, int index, const Texture *t, const TextureView *view) {
     id<MTLTexture> image=texture_view(t,view);
-    Descriptor *slot=descriptor_slot(pool,index);
+    pthread_mutex_lock(&descriptors_lock);Descriptor *slot=descriptor_slot(pool,index);
     pthread_mutex_lock(&t->backing->pool->lock);
     t->backing->references++;
     pthread_mutex_unlock(&t->backing->pool->lock);
     id previous=(__bridge_transfer id)slot->resource; (void)previous;
     backing_release(slot->view);
     slot->resource=(__bridge_retained void *)image; slot->view=t->backing;
+    pthread_mutex_unlock(&descriptors_lock);
 }
 @interface HyTargetImage : NSObject {
 @public id<MTLTexture> image; TextureBacking *backing; int format;
@@ -875,6 +925,7 @@ static void command_copy_texture(HyCommands *c,const Texture *source,const Textu
                                  const Texture *destination,const TextureView *destination_view,const HyCopyRegion *to,uint32_t flags) {
     HyTextureCopy *copy=[HyTextureCopy new];copy->source=image_snapshot(source,source_view);
     copy->destination=image_snapshot(destination,destination_view);
+    if(copy->destination->backing->flags&0x10)hy_fail("GPU copy into CPU linear texture is unsupported");
     check_copy_region(copy->source->image,from);check_copy_region(copy->destination->image,to);
     copy->from=*from;copy->to=*to;copy->flags=flags;
     void *value=(__bridge void *)copy;void *record=hy_commands_record(c,HY_COPY_TEXTURE,sizeof value);
@@ -890,12 +941,13 @@ static void command_targets(HyCommands *c,int count,Texture *const *textures,con
     memcpy(record,&value,sizeof value);command_keep(record,sizeof value,targets);
 }
 static void descriptor_finalize(DescriptorPool *pool) {
+    pthread_mutex_lock(&descriptors_lock);
     for (int i=0;i<pool->count;i++) {
         Descriptor *slot=descriptor_slot(pool,i);
         id resource=(__bridge_transfer id)slot->resource; (void)resource;
         backing_release(slot->view); *slot=(Descriptor){0};
     }
-    memset(pool,0,sizeof *pool);
+    memset(pool,0,sizeof *pool);pthread_mutex_unlock(&descriptors_lock);
 }
 static uint32_t sampler_initialize(void **object, const void *builder) {
     void *(*get)(const char *)=hy_symbol("nvnBootstrapLoader");
@@ -918,9 +970,32 @@ static uint32_t sampler_initialize(void **object, const void *builder) {
 static void sampler_finalize(void **object) { id sampler=(__bridge_transfer id)*object; (void)sampler; *object=NULL; }
 static void register_sampler(const DescriptorPool *pool, int index, void *const *object) {
     if (!*object) hy_fail("registering invalid sampler");
-    Descriptor *slot=descriptor_slot(pool,index);
+    pthread_mutex_lock(&descriptors_lock);Descriptor *slot=descriptor_slot(pool,index);
     id sampler=(__bridge id)*object, previous=(__bridge_transfer id)slot->resource; (void)previous;
-    backing_release(slot->view); slot->view=NULL; slot->resource=(__bridge_retained void *)sampler;
+    backing_release(slot->view); slot->view=NULL; slot->resource=(__bridge_retained void *)sampler;pthread_mutex_unlock(&descriptors_lock);
+}
+static uint64_t texture_handle(const void *object,int texture,int sampler) {
+    (void)object;if(texture<0 || texture>=1048576 || sampler<0 || sampler>=4096)hy_fail("invalid texture/sampler ID");
+    uint32_t bits=(uint32_t)texture|((uint32_t)sampler<<20);return (uint64_t)(int64_t)(int32_t)bits|0x100000000ull;
+}
+static void command_textures(HyCommands *c,int stage,int first,int count,const uint64_t *handles) {
+    if(first<0 || count<0 || first>32 || count>32-first || (count && !handles))hy_fail("invalid texture binding range");
+    for(int i=0;i<count;i++)hy_commands_texture(c,stage,first+i,handles[i]);
+}
+static NSArray *sampled_resources(const DescriptorPool *textures,const DescriptorPool *samplers,uint64_t handle) {
+    if(!(handle&0x100000000ull))hy_fail("invalid combined texture handle");
+    pthread_mutex_lock(&descriptors_lock);pthread_mutex_lock(&pools_lock);
+    const DescriptorPool *sets[]={textures,samplers};int indices[]={(int)(handle&0xfffff),(int)((handle>>20)&4095)};Descriptor *slots[2];
+    for(unsigned i=0;i<2;i++) {
+        const DescriptorPool *set=sets[i];Pool *p;
+        for(p=pools;p && p!=set->pool;p=p->next){}
+        if(!p || set->count<1 || set->offset>p->size || (size_t)set->count>(p->size-set->offset)/sizeof(Descriptor))hy_fail("descriptor pool is not live");
+        slots[i]=descriptor_slot(set,indices[i]);
+    }
+    id image=(__bridge id)slots[0]->resource,sampler=(__bridge id)slots[1]->resource;
+    if(!slots[0]->view || !image || ![image conformsToProtocol:@protocol(MTLTexture)] || slots[1]->view || ![sampler isKindOfClass:HySampler.class])hy_fail("descriptor resource type mismatch");
+    TextureBacking *backing=slots[0]->view;pthread_mutex_lock(&backing->pool->lock);refresh_linear_locked(backing);pthread_mutex_unlock(&backing->pool->lock);
+    NSArray *result=@[image,sampler];pthread_mutex_unlock(&pools_lock);pthread_mutex_unlock(&descriptors_lock);return result;
 }
 static void window_defaults(WindowBuilder *b) { void *d=b->device; memset(b,0,sizeof *b); b->device=d; b->interval=1; }
 static void window_device(WindowBuilder *b, void *d) { b->device=d; }
@@ -949,11 +1024,13 @@ static uint32_t window_initialize(Window *w, const WindowBuilder *b) {
 }
 static int window_acquire(Window *w,GpuSync **sync,int *index) {
     if (!sync || !*sync || !index) hy_fail("invalid window acquisition");
-    // Initial headless buffers have never been presented and are available.
-    // Recycling must wait for a real presentation fence; never silently wrap.
-    if (w->next>=w->builder.count) hy_fail("window presentation/recycling not implemented");
-    void *host_queue=(__bridge void *)queue;queue_fence(&host_queue,sync,0,0);
-    *index=w->next++;return 0;
+    for(int attempt=0;attempt<w->builder.count;attempt++) {
+        int candidate=(w->next+attempt)%w->builder.count;
+        if(w->acquired[candidate])continue;
+        void *host_queue=(__bridge void *)queue;queue_fence(&host_queue,sync,0,0);
+        w->acquired[candidate]=1;w->next=(candidate+1)%w->builder.count;*index=candidate;return 0;
+    }
+    hy_fail("all window textures are still acquired");
 }
 static void window_crop(Window *w, int x, int y, int width, int height) {
     Texture *texture=w->builder.textures[0];
@@ -966,9 +1043,13 @@ static int window_get_interval(const Window *w) { return w->builder.interval; }
 static void window_get_crop(const Window *w, int *rectangle) { memcpy(rectangle,w->crop,sizeof w->crop); }
 static void display_initialize(void) {
     if (!device) hy_fail("display initialized before Metal");
-    surface = [CAMetalLayer layer]; surface.device = device;
+    if(!surface)surface=[CAMetalLayer layer];surface.device = device;
     surface.pixelFormat = MTLPixelFormatBGRA8Unorm;
     surface.drawableSize = CGSizeMake(1280, 720);
+}
+void hy_graphics_attach_layer(void *layer) {
+    if(surface || !layer)hy_fail("graphics layer already assigned or missing");
+    surface=(__bridge CAMetalLayer *)layer;
 }
 static unsigned display_open(void **out) { *out = &display_token; return 0; }
 static unsigned display_layer(void **out, void *display) {
@@ -1050,6 +1131,7 @@ static void command_validate(uint32_t op,const void *payload,size_t size) {
     case HY_MULTISAMPLE_STATE:expected=24;break;
     case HY_REPORT_COUNTER:expected=sizeof(HyCounterRecord);break;
     case HY_BIND_PROGRAM:expected=sizeof(HyProgramRecord);break;
+    case HY_BIND_TEXTURE:expected=sizeof(HyTextureRecord);break;
     case HY_CLEAR_COLOR:expected=sizeof(HyClearColorRecord);break;
     case HY_CLEAR_DEPTH:expected=sizeof(HyClearDepthRecord);break;
     case HY_VIEWPORT:case HY_SCISSOR:expected=16;break;
@@ -1069,88 +1151,14 @@ static void command_validate(uint32_t op,const void *payload,size_t size) {
     }
     if(size!=((expected+7)&~(size_t)7)) hy_fail("invalid command payload length");
 }
-static void queue_submit(void *const *object,int count,const uint64_t *handles) {
-    if (!object || !*object || count<0 || count>64 || (count && !handles)) hy_fail("invalid command submission");
-    for (int list=0;list<count;list++) {
-        uint64_t address=handles[list];fprintf(stderr,"SUBMIT list=%d\n",list);
-        for (unsigned step=0;;step++) {
-            if (step==4096 || (address&7)) hy_fail("command traversal limit/alignment");
-            NSData *header_bytes=pool_copy(address,8);HyRecord header;memcpy(&header,header_bytes.bytes,8);
-            if (header.size<8 || (header.size&7) || header.size>1048576) hy_fail("invalid recorded command size");
-            NSData *bytes=pool_copy(address,header.size);const uint8_t *payload=(const uint8_t *)bytes.bytes+8;
-            size_t payload_size=header.size-8;command_validate(header.op,payload,payload_size);
-            fprintf(stderr,"  op=%u size=%u",header.op,header.size);
-            if (!step && header.op!=HY_BEGIN) hy_fail("command handle does not start with BEGIN");
-            switch (header.op) {
-            case HY_BIND_PROGRAM: {
-                if (payload_size<sizeof(HyProgramRecord)) hy_fail("short program command");
-                HyProgramRecord record;memcpy(&record,payload,sizeof record);
-                NSArray *shaders=command_resource(address,record.shaders,header.size,header.op);
-                fprintf(stderr," program stages=%#x",record.stages);
-                for (HyShader *shader in shaders) fprintf(stderr," shader=%u:%s",shader->stage,shader->key);
-                break;
-            }
-            case HY_RENDER_TARGETS: case HY_UNIFORM_BUFFER: case HY_VERTEX_BUFFER: case HY_DRAW_ELEMENTS:
-            case HY_COPY_TEXTURE: case HY_FENCE_SYNC: {
-                if (payload_size<8) hy_fail("short resource command");
-                void *token;memcpy(&token,payload,8);id resource=command_resource(address,token,header.size,header.op);
-                if (header.op==HY_RENDER_TARGETS) {
-                    HyRenderTargets *targets=resource;
-                    for (id color in targets->colors) if (color!=[NSNull null]) {
-                        HyTargetImage *image=color;fprintf(stderr," color=%#x:%lux%lu",image->format,(unsigned long)image->image.width,(unsigned long)image->image.height);
-                    }
-                    if (targets->depth) fprintf(stderr," depth=%#x",targets->depth->format);
-                } else if (header.op==HY_UNIFORM_BUFFER || header.op==HY_VERTEX_BUFFER) {
-                    HyBoundBuffer *buffer=resource;fprintf(stderr," stage=%d index=%d offset=%zu length=%zu",buffer->stage,buffer->index,buffer->offset,buffer->length);
-                } else if (header.op==HY_DRAW_ELEMENTS) {
-                    HyDrawIndexed *draw=resource;fprintf(stderr," draw primitive=%d index=%d count=%d offset=%zu",draw->primitive,draw->index_type,draw->count,draw->indices->offset);
-                } else if (header.op==HY_COPY_TEXTURE) {
-                    HyTextureCopy *copy=resource;fprintf(stderr," copy %#x->%#x %dx%d->%dx%d flags=%#x",copy->source->format,copy->destination->format,copy->from.width,copy->from.height,copy->to.width,copy->to.height,copy->flags);
-                } else {
-                    HyRecordedSync *sync=resource;fprintf(stderr," fence condition=%d flags=%#x",sync->condition,sync->flags);
-                }
-                break;
-            }
-            case HY_VERTEX_ATTRIBUTES: case HY_VERTEX_STREAMS:
-                fprintf(stderr," vertex-state:");for (size_t k=0;k<payload_size;k+=4) { uint32_t value;memcpy(&value,payload+k,4);fprintf(stderr," %x",value); }break;
-            case HY_MULTISAMPLE_STATE: case HY_COLOR_STATE: case HY_BLEND_STATE: case HY_CHANNEL_MASK_STATE:
-            case HY_POLYGON_STATE: case HY_DEPTH_STENCIL_STATE:
-                fprintf(stderr," state:");for (size_t k=0;k<payload_size;k++) fprintf(stderr," %02x",payload[k]);
-                if (header.op==HY_COLOR_STATE) fprintf(stderr," logic=%d alpha=%d blend0=%d",
-                    ((int (*)(const void *))lookup("nvnColorStateGetLogicOp"))(payload),
-                    ((int (*)(const void *))lookup("nvnColorStateGetAlphaTest"))(payload),
-                    ((int (*)(const void *,int))lookup("nvnColorStateGetBlendEnable"))(payload,0));
-                if (header.op==HY_MULTISAMPLE_STATE) fprintf(stderr," samples=%d enabled=%d",
-                    ((int (*)(const void *))lookup("nvnMultisampleStateGetSamples"))(payload),
-                    ((int (*)(const void *))lookup("nvnMultisampleStateGetMultisampleEnable"))(payload));
-                if (header.op==HY_POLYGON_STATE) fprintf(stderr," cull=%d front=%d polygon=%d offset=%d",
-                    ((int (*)(const void *))lookup("nvnPolygonStateGetCullFace"))(payload),
-                    ((int (*)(const void *))lookup("nvnPolygonStateGetFrontFace"))(payload),
-                    ((int (*)(const void *))lookup("nvnPolygonStateGetPolygonMode"))(payload),
-                    ((int (*)(const void *))lookup("nvnPolygonStateGetPolygonOffsetEnables"))(payload));
-                if (header.op==HY_DEPTH_STENCIL_STATE) fprintf(stderr," depth-test=%d write=%d func=%d stencil=%d",
-                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthTestEnable"))(payload),
-                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthWriteEnable"))(payload),
-                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthFunc"))(payload),
-                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetStencilTestEnable"))(payload));
-                break;
-            case HY_ALPHA_REF: {float value;memcpy(&value,payload,4);fprintf(stderr," alpha-ref=%g",value);break;}
-            case HY_DEPTH_RANGE: {float range[2];memcpy(range,payload,8);fprintf(stderr," depth-range=%g,%g",range[0],range[1]);break;}
-            case HY_VIEWPORT: case HY_SCISSOR: {int rect[4];memcpy(rect,payload,16);fprintf(stderr," rectangle=%d,%d %dx%d",rect[0],rect[1],rect[2],rect[3]);break;}
-            default:break;
-            }
-            fputc('\n',stderr);
-            if (header.op==HY_END) break;
-            if (header.op==HY_JUMP) { if (payload_size!=8) hy_fail("invalid command jump");memcpy(&address,payload,8); }
-            else address+=header.size;
-        }
-    }
-    hy_fail("Metal command replay not implemented (submission inspected)");
-}
+#include "replay.inc"
 static void *lookup(const char *name) {
     static const struct { const char *name; void *fn; } functions[] = {
         {"nvnDeviceGetProcAddress", get_proc}, {"nvnDeviceGetInteger", integer},
         {"nvnDeviceGetTimestampInNanoseconds", device_timestamp},
+        {"nvnDeviceGetTextureHandle", texture_handle},
+        {"nvnCommandBufferBindTexture", hy_commands_texture},
+        {"nvnCommandBufferBindTextures", command_textures},
         {"nvnProgramInitialize", program_initialize}, {"nvnProgramFinalize", program_finalize},
         {"nvnProgramSetShaders", program_shaders},
         {"nvnProgramSetDebugLabel", program_label},
@@ -1188,6 +1196,11 @@ static void *lookup(const char *name) {
         {"nvnSyncWait", sync_wait}, {"nvnQueueFenceSync", queue_fence}, {"nvnQueueWaitSync", queue_wait},
         {"nvnQueueFinish", queue_finish}, {"nvnQueueFinalize", queue_finalize},
         {"nvnQueueSubmitCommands", queue_submit},
+        {"nvnQueuePresentTexture", queue_present},
+        {"nvnQueueResetMemoryUsageCounts", queue_reset_used},
+        {"nvnQueueGetTotalCommandMemoryUsed", queue_command_used},
+        {"nvnQueueGetTotalControlMemoryUsed", queue_control_used},
+        {"nvnQueueGetTotalComputeMemoryUsed", queue_compute_used},
         {"nvnQueueFlush", queue_finish}, // Synchronous flush until asynchronous submission is implemented.
         {"nvnCommandBufferReportCounter", command_counter},
         {"nvnCommandBufferSetDepthRange", hy_commands_depth_range},
@@ -1212,6 +1225,7 @@ static void *lookup(const char *name) {
         {"nvnCommandBufferBindVertexStreamState", hy_commands_streams},
         {"nvnCommandBufferBindVertexBuffers", command_vertex_buffers},
         {"nvnCommandBufferDrawElements", command_draw_elements},
+        {"nvnCommandBufferDrawElementsBaseVertex", command_draw_elements_base},
         {"nvnCommandBufferCopyTextureToTexture", command_copy_texture},
         {"nvnCommandBufferSetTiledCacheAction", hy_commands_tiled_cache},
         {"nvnCommandBufferBarrier", hy_commands_barrier},
@@ -1226,7 +1240,7 @@ static void *lookup(const char *name) {
         {"nvnTextureBuilderSetDepth", texture_depth}, {"nvnTextureBuilderSetSize2D", texture_size2d},
         {"nvnTextureBuilderSetSize3D", texture_size3d},
         {"nvnTextureBuilderSetLevels", texture_levels}, {"nvnTextureBuilderSetFormat", texture_format},
-        {"nvnTextureBuilderSetDepthStencilMode", texture_depth_mode},
+        {"nvnTextureBuilderSetDepthStencilMode", texture_depth_mode}, {"nvnTextureBuilderSetSwizzle", texture_swizzle},
         {"nvnTextureBuilderSetSamples", texture_samples}, {"nvnTextureBuilderSetStorage", texture_storage},
         {"nvnTextureBuilderSetStride", texture_stride}, {"nvnTextureBuilderSetPackagedTextureLayout", texture_layout},
         {"nvnTextureBuilderGetPackagedTextureLayout", texture_get_layout},

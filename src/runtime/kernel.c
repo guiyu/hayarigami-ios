@@ -228,6 +228,9 @@ static void callers(const uint64_t *r) {
     uintptr_t frame = r[29];
     uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
     uintptr_t bottom = top - pthread_get_stacksize_np(pthread_self());
+    for(size_t i=0;i<physical_count;i++)if(physical[i].state==0xb && frame>=physical[i].base && frame<physical[i].base+physical[i].size) {
+        bottom=physical[i].base;top=bottom+physical[i].size;break;
+    }
     for (int depth = 0; depth < 20 && frame >= bottom && frame <= top - 16 && !(frame & 15); depth++) {
         uint64_t *fp = (uint64_t *)frame;
         fputs("  caller ", stderr); location(fp[1]); fputc('\n', stderr);

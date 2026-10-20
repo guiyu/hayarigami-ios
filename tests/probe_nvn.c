@@ -31,7 +31,7 @@ static void probe(void) {
         else if (i==1 || i==2) ((void (*)(void *,int,int))fn)(view,0,1);
         else if (i==4) ((void (*)(void *,int,int,int,int))fn)(view,2,3,4,5);
         else ((void (*)(void *,int))fn)(view,i==3?0x25:i==6?1:0);
-        for (unsigned k=32;k<sizeof view;k++) if (view[k]!=0xa5) hy_fail("view overflow at %u",k);
+        for (unsigned k=16;k<sizeof view;k++) if (view[k]!=0xa5) hy_fail("view overflow at %u",k);
     }
     const struct { const char *name; size_t size; } states[]={
         {"nvnMultisampleState",24},{"nvnColorState",4},{"nvnBlendState",8},
@@ -43,6 +43,13 @@ static void probe(void) {
         if (host_get(name)!=get(name)) hy_fail("pure SDK state was not preserved: %s",name);
         ((void (*)(void *))host_get(name))(state);
         for (size_t j=states[k].size;j<sizeof state;j++) if (state[j]!=0xa5) hy_fail("state ABI boundary: %s",name);
+    }
+    for(unsigned query=0x11;query<=0x12;query++) {
+        int original_reserved=-1,host_reserved=-1;
+        ((void (*)(const void *,unsigned,int *))get("nvnDeviceGetInteger"))(NULL,query,&original_reserved);
+        ((void (*)(const void *,unsigned,int *))host_get("nvnDeviceGetInteger"))(NULL,query,&host_reserved);
+        printf("RESERVED query=%#x original=%d host=%d\n",query,original_reserved,host_reserved);
+        if(original_reserved!=256 || host_reserved!=original_reserved)hy_fail("reserved descriptor range differs from title SDK");
     }
     _Alignas(8) uint8_t sample_state[32]; memset(sample_state,0xa5,sizeof sample_state);
     ((void (*)(void *))host_get("nvnMultisampleStateSetDefaults"))(sample_state);

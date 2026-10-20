@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 static void callback_a(void) { fputs("SDK callback A reached\n", stderr); }
 static void callback_b(void) {
     fputs("SDK initialized; invoking module constructors\n", stderr);
@@ -25,11 +26,12 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[2], "--load-only")) { puts("PASS: all guest modules relocated"); return 0; }
     if (argc != 4) hy_fail("boot requires an extracted RomFS directory");
     hy_filesystem_init(argv[3]);
+    if(getenv("HY_HEADLESS_PAD") && !strcmp(getenv("HY_HEADLESS_PAD"),"1")) {hy_input_set(0,1);fputs("host diagnostic virtual pad attached\n",stderr);}
     void (*start)(uint64_t, uint64_t, void (*)(void), void (*)(void), void (*)(void)) =
         hy_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     if (!start) hy_fail("SDK Start export not found");
     fputs("entering real SDK Start\n", stderr);
-    alarm(120); // Resource initialization can outlast the short loader/fixture guard.
+    alarm(600); // Allow the real opening movie and gameplay checks to complete.
     start(0x100, 0, callback_a, callback_b, callback_c);
     hy_fail("SDK Start unexpectedly returned");
 }

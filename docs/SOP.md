@@ -2,7 +2,7 @@
 
 ## 当前阶段
 
-现在可以复跑分析、资源库编译、游戏代码离线改写/验证与容器生成。**当前没有安装命令或可玩的 App**；不要安装实验性 Guest.framework，也不需要连接手机。所有生成目录必须是本仓库 `.local/` 的子目录；脚本拒绝越界路径和输出覆盖。
+已增加真实 Metal 命令执行、UIKit App、Apple 视频解码及本地存档适配。独立开发签名 App 已安装到 iPhone，真机已显示标题并进入片头；片头按键切换崩溃的修复仍在验收。编译或安装通过不代表剧情、存档和三代内容全部通过。常规输出留在 `.local/`；签名 App 在权限 0700 的 `/private/tmp/hayarigami-ios-*` 中构建，避免 Documents 文件提供程序附加 FinderInfo 导致签名失败。
 
 在仓库根目录执行。先准备 Python 环境（已存在环境可复用，精确依赖在 requirements.txt）：
 
@@ -13,7 +13,7 @@ python3 -m venv .local/venv
 
 本次实际使用的是上层工作目录的 `work/venv/bin/python`，依赖与上述文件一致；无需为复看既有结果重复安装。Xcode/LLVM 已存在，本项目没有安装或改变它们。
 
-下面变量由本地使用者填入文件路径，**不填密钥内容**。不要 source 旧项目 local.env，也不要复用其签名或设备配置。
+下面变量由本地使用者填入文件路径，**不填密钥内容**。密钥、游戏资源与签名材料不得进入 Git。用户已授权复用原开发团队签名；新 App 必须使用独立的 `com.guiyu.hayarigami`，不能复用 D2R 的 bundle ID 或覆盖其 App。
 
 ```sh
 PY="$PWD/.local/venv/bin/python"
@@ -143,3 +143,21 @@ sh tests/check_shader_draw.sh .local/shaders/source .local/shaders/metal-v2
 ```
 
 该测试验证256个实际GPU像素与六个拒绝路径，不代替队列执行、标题画面、签名安装验收。安装交付标准已明确为能进入游戏，不能以诊断版替代。
+
+
+## 媒体及片头退出回归
+
+`sh scripts/check_media.sh` 使用 ffmpeg/ffprobe 生成合成 H.264、B 帧与 AAC 输入，验证 Apple 解码器、NV12、时间戳、调用方输出缓冲和逐帧/逐包释放；不使用游戏资源。`sh scripts/check_native.sh` 包含真实 ARM64 切栈后退出、撤销游戏栈、宿主 TLS 清理与 join 的100轮回归。运行完整 native 回归前先执行 `sh scripts/build_runtime.sh`，防止合成加载测试误用旧宿主二进制。
+
+真机调试以 `xcrun devicectl device process launch --start-stopped` 启动当前已签名 App，再在新的 LLDB 会话中选择目标设备并 attach；`hy_fail` 断点用于明确拒绝路径，EXC_BAD_ACCESS 需保留线程栈、寄存器与实际输入阶段。不要把调试器自身崩溃当作应用崩溃。可在 queue_present 断点从当前窗口纹理读取实际RGBA帧，仅保存在应用Documents与本地忽略目录。最终包必须以同一版本完成真机按键、场景、剧情及存档验证为准。
+
+
+## 导出已签名 IPA
+
+在对应版本完成真机验收后，执行 `python3 scripts/export_ipa.py /private/tmp/hayarigami-ios-*/DerivedData/Build/Products/Release-iphoneos/Hayarigami.app .local/ipa/实际版本名.ipa`（必须将通配路径替换为唯一、明确的当前构建目录）。脚本不重新签名、不覆盖已有输出，先校验App签名及profile的Bundle ID和有效期，创建Payload归档，逐文件CRC检查，再记录版本、体积与SHA-256。receipt只证明签名及归档完整性；未验收版本必须保留candidate标记，不能把候选包描述为稳定最终包。
+
+## 卡顿诊断与 build 9
+
+先在 LLDB 完全 detach、无逐帧断点的状态下，用 `xcrun xctrace record --template 'Time Profiler' --device '柱间测试机' --attach 实际PID --time-limit 10s --output 本地trace路径` 采样。用 export 的 time-profile 表和当前版本的真实装载地址符号化，禁止用重建后的二进制解释旧版本地址。不同场景的CPU采样不能换算为同场景FPS提升。
+
+build 9 仅将导出符号线性遍历改为初始化时构建的只读排序索引；原生套件与iOS构建通过，实际安装登记版本9，用户已确认“明显改善”。存档/冷启动验收仍需单独完成。不要直接将 build 8 候选 IPA 当作性能修复版交付。

@@ -15,8 +15,10 @@ compile_run bc7 tests/test_bc7.c src/gfx/bc7.c
 compile_run mix tests/test_audio_mix.c src/audio/mix.c
 compile_run renderer tests/test_renderer.c src/audio/mix.c
 compile_run output tests/test_audio_output.c -framework AudioToolbox
+compile_run pcm tests/test_pcm.c -framework AudioToolbox
 compile_run vertex tests/test_vertex_state.c
 compile_run input tests/test_input.c
+compile_run exit-section tests/test_exit_section.c
 compile_run account tests/test_account.c
 compile_run shader-layout tests/test_shader_layout.c
 compile_run loader-symbols tests/test_loader_symbols.c
@@ -24,13 +26,24 @@ compile_run commands tests/test_commands.c
 compile_run gpu-time tests/test_gpu_time.c
 compile_run texture-layout tests/test_texture_layout.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
-    tests/test_filesystem.c src/runtime/filesystem.c -o "$OUT/filesystem"
+    tests/test_filesystem.c src/runtime/filesystem.c src/runtime/account.c -o "$OUT/filesystem"
 fixture=$(mktemp -d "$OUT/fs.XXXXXX")
 printf abcd > "$fixture/data.bin"
 printf outside > "$OUT/outside.bin"
 ln -s ../outside.bin "$fixture/escape"
 "$OUT/filesystem" "$fixture"
-for name in threads condition renderer audio_output; do
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
+    tests/test_save.c src/runtime/filesystem.c src/runtime/account.c -o "$OUT/save"
+save_fixture=$(mktemp -d "$OUT/save.XXXXXX")
+ln -s ../outside.bin "$save_fixture/escape"
+"$OUT/save" "$save_fixture"
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
+    tests/test_save_roots.c src/runtime/filesystem.c src/runtime/account.c -o "$OUT/save-roots"
+mkdir -p "$fixture/nested"
+"$OUT/save-roots" "$fixture" "$fixture"
+"$OUT/save-roots" "$fixture" "$fixture/nested"
+"$OUT/save-roots" "$fixture/nested" "$fixture"
+for name in threads condition thread_wait thread_wait_lifetime renderer audio_output; do
     case "$name" in
         renderer) set -- src/audio/mix.c ;;
         audio_output) set -- -framework AudioToolbox ;;
@@ -40,10 +53,12 @@ for name in threads condition renderer audio_output; do
         "tests/test_$name.c" "$@" -o "$OUT/tsan-$name"
     "$OUT/tsan-$name"
 done
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g tests/test_thread_native_exit.c src/runtime/gate.S -o "$OUT/thread-native-exit"
+"$OUT/thread-native-exit"
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g tests/test_kernel.c -o "$OUT/kernel"
 "$OUT/kernel"
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc \
-    tests/test_metal_pool.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_metal_pool.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/metal"
 if "$OUT/metal" --reject-layout > "$OUT/metal-reject.log" 2>&1; then
     echo 'FAIL: incompatible texture layouts accepted' >&2; exit 1
@@ -78,11 +93,11 @@ xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_gpu_coun
     -framework Metal -framework Foundation -o "$OUT/gpu-counter"
 "$OUT/gpu-counter"
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
-    tests/test_command_sync.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_command_sync.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/command-sync"
 "$OUT/command-sync"
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
-    tests/test_command_submit.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_command_submit.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/command-submit"
 for opcode in 15 24 13 7 26 999 type; do
     if "$OUT/command-submit" "$opcode" > "$OUT/command-submit-$opcode.log" 2>&1; then
@@ -97,7 +112,7 @@ for opcode in 15 24 13 7 26 999 type; do
     fi
 done
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc \
-    tests/test_program.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_program.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/program"
 "$OUT/program"
 for rejected in code-range stage; do
@@ -112,7 +127,7 @@ for rejected in code-range stage; do
     fi
 done
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
-    tests/test_render_targets.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_render_targets.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/render-targets"
 "$OUT/render-targets"
 if "$OUT/render-targets" --reject-uniform-range > "$OUT/uniform-reject.log" 2>&1; then
@@ -122,7 +137,7 @@ else
     rg -q 'uniform buffer outside live memory pools' "$OUT/uniform-reject.log"
 fi
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
-    tests/test_texture_copy.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    tests/test_texture_copy.m src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/texture-copy"
 "$OUT/texture-copy"
 if "$OUT/texture-copy" --reject-copy-range > "$OUT/texture-copy-reject.log" 2>&1; then
@@ -131,6 +146,18 @@ else
     check_rc=$?;test "$check_rc" -eq 42
     rg -q 'texture copy region outside image bounds' "$OUT/texture-copy-reject.log"
 fi
+if "$OUT/texture-copy" --reject-linear-destination > "$OUT/texture-copy-linear-reject.log" 2>&1; then
+    echo 'FAIL: GPU write into CPU linear texture accepted' >&2;exit 1
+else
+    check_rc=$?;test "$check_rc" -eq 42
+    rg -q 'GPU copy into CPU linear texture is unsupported' "$OUT/texture-copy-linear-reject.log"
+fi
+for name in replay_clear replay_copy linear_texture; do
+    xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
+        "tests/test_$name.m" src/runtime/input.c src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+        -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/$name"
+    "$OUT/$name"
+done
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_bc7_metal.m src/gfx/bc7.c \
     -framework Metal -framework Foundation -o "$OUT/bc7-metal"
 "$OUT/bc7-metal"

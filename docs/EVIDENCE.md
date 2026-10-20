@@ -184,3 +184,40 @@ GPU 时间戳验证使用 Metal timestamp counter set，前后 sampleTimestamps 
 新增运行时 Metal 库加载函数，验证控制段key、代码/常量长度和SHA-256、阶段、Profile、alpha条件，以及当前平台metallib的SHA-256。用被校验的同一份NSData创建Metal库，避免校验文件后再次按路径加载另一份内容。当前仅允许vertex/fragment与已验证的Always或Greater/0特化；没有对其他资源/状态兼容性作保证。
 
 使用真实首绘VS/PS，经此加载函数，在16×16目标上用本作对应的Float3位置、RGBA8颜色、ushort索引与128字节identity常量布局绘制四边形，256像素全部正确。源码单字节变化、非零alpha参考值、库单字节变化、错误Profile、错误阶段与非字典JSON共六个负例均退出42。此探针使用合成顶点和常量，尚未接入游戏命令队列，不是标题画面或可玩性证明。
+
+
+## 真机片头与按键退出调查（2026-10-20，验收进行中）
+
+独立 UIKit App 已使用用户授权的原开发团队身份签名，独立 Bundle ID 为 `com.guiyu.hayarigami`；实际安装到目标 iPhone 16。用户确认标题、颜色显示与片头均可到达，但片头按虚拟键仍曾闪退。因此不将安装或标题视为最终可玩验收，也尚未导出最终 IPA。
+
+此前真机日志明确记录 linear texture 的 Metal 对齐拒绝；线性 R8/RG8 视频纹理改为普通 Metal 图像，依据实际 row stride 上传。随后日志出现不同纹理布局复用同一地址的拒绝；仅当旧 Texture 对象全部 finalize 后才允许不同布局重新分配，旧命令/描述符仍保留独立旧图像。同布局仍复用原 backing，避免丢失 GPU 内容。padded RG8 上传、swizzle、旧快照保留与 R8 重分配测试通过。
+
+第 2 版真机 LLDB 捕获 `decoded_video` 中 `memcpy` 的空目标地址：`output=nil`、1920×1080、时间戳13秒、已解码约388帧；ready=0、pending=16。回调无局部 autorelease pool，已消费帧仍滞留。新增弱引用回归修复前失败，局部池修复后120次全高清帧消费即释放。审查随后发现 send_input 的压缩包及AAC输出也在逐包池外创建；AAC消费后弱引用回归修复前失败，加入入口局部池后通过。原Apple视频颜色、12个B帧展示顺序、6个AAC包24576字节PCM检查通过。
+
+第 3 版真机按键触发片头线程退出时，LLDB 再捕获 `NSConcreteMutableData dealloc` 向游戏栈写入的 protection fault，SP=0x3302b06d0；游戏线程同时在 CloseHandle 的 pthread_join 中等待。旧 hy_thread_returned 在游戏栈上先发布 exited、随后直接 pthread_exit，允许SDK在系统TLS/ObjC清理结束前撤销栈。修复为在宿主 run 中保存返回上下文，退出游戏时先回到原宿主栈，再发布退出并返回 pthread。独立真切栈测试修复前退出138，修复后100次“等待退出后立即保护游戏栈，再join”的清理验证通过。
+
+第 4 版包含以上两类内存生命周期修复，已签名、安装并连接真机调试器。已直接从真机正在呈现的Metal纹理读回片头帧，而非用模拟画面替代；按键切换、剧情、保存恢复与持续运行仍在验收。
+
+第 4 版进一步真机按键后，hy_fail 断点取得新 BC7 1920×1080、flags0x20、offset424674816、size2621440，与旧线性RG8 960×540、stride1920、offset424186304、size1036800重叠；旧objects=1、refs=5。该路径旧视频对象寿命长于CPU分配的使用期。仅为“旧线性视频图像→新CPU上传BC7图像”支持独立Metal图像，不放开一般GPU写入纹理的不同布局别名。新增live旧纹理的重叠BC7回归修复前退出42，修复后验证BC7解码像素与旧图像不变、释放及后续R8重分配通过；已纳入完整native检查。第5版已签名安装，真机继续验收。完整native（含ASan/UBSan、TSan、真实Metal、切栈）与合成媒体检查通过。
+
+复核同时封闭该CPU采样路径的GPU写入边界：录制复制命令时明确拒绝以linear纹理为目的端（渲染目标原已有usage检查）。新增同格式R8复制负例修复前返回成功、修复后退出42并给出明确原因，避免CPU副本与GPU写入静默失步。
+
+第5版实际切后台再前台后，LLDB取得send_input中result=-12903，SDK头文件确认kVTInvalidSessionErr。保留最近IDR至当前输入的压缩包（上限64MiB/1024包），失效时重建VT会话并重放当前GOP；按本GOP已收到的PTS去重，保留pending/ready的既有帧。新增第5个B帧包后主动Invalidate测试修复前-12903中止，修复后12帧完整、一次且展示顺序正确。UIKit inactive/active现驱动媒体暂停；审查发现“前台入队、后台执行”竞态，新增阻塞worker的排队回归修复前失败。worker开始及每次视频提交前重新等待active后，该回归和媒体生命周期检查全部通过。第7版已构建签名，仍需真机按键、剧情及前后台恢复验收。
+
+打包自检发现早期xcodegen生成的Info.plist固定CFBundleVersion=1，虽然每次二进制签名/安装路径不同，但命令行CURRENT_PROJECT_VERSION不会反映到应用版本。已将源plist改为构建设置替换，并在boot.log加入构建号。第7次迭代候选归档完整性通过（压缩4202260779字节、553文件），不作为已验收最终包。此轮USB清单未发现iPhone，CoreDevice只报告localNetwork；网络安装超过8分钟仍未完成、未返回安装成功，已中断该安装并请求用户恢复数据线。构建8将用于下一轮实际安装与启动版本核对，剧情/存档及持续运行尚未验收。
+
+构建8候选IPA已导出并通过codesign --verify --deep --strict、profile身份/有效期及ZIP CRC检查；553文件、4202260846字节，SHA-256 65082ee68c15a4cac3cadffd511982b16178ef3b998722b4c576fde98e519cf2，CFBundleVersion=8。仍未完成该版本的真机安装、按键、剧情和存档验收，不标记最终稳定版。旧候选归档已在新版验证完整性后删除，游戏资源与签名信息仍仅留本地忽略目录。
+
+恢复有线连接后，构建8安装成功；设备实际应用清单确认bundleVersion=8，启动日志出现Hayarigami build 8 start，已用LLDB连接该进程并读回其真实标题帧，按A到游戏选择及第一代Now Loading。此项仅证明最新构建的安装、启动和当前输入，片头跳转及剧情仍在本轮真机验收中。
+
+### 2026-10-20 build 9: measured symbol-lookup bottleneck
+
+- User confirmed build 8 remained very slow after LLDB detached. A 10-second iPhone Time Profiler recording (PID 95505, `.local/runtime/device-build8-performance.trace`) captured 7,533 running CPU samples on the game/render thread, including 5,908 in `lookup`; symbolication shows repeated `hy_symbol` linear scans and string comparison. The audio renderer also repeatedly resolves exports. These are CPU sample proportions, not frame-time percentages.
+- Replaced per-call export scans with one immutable sorted index per loaded module, built before relocation. Binary search preserves module order, undefined exclusion, absolute values, and the first original symbol for duplicate names. No mutable runtime cache or rendering behavior changes.
+- Regression: original linear implementation fails the comparison-count assertion for 40,000 exports; indexed implementation resolves all exports and a missing name with 654,481 comparisons. Weak/strong imports, host definitions, duplicate exports and absolute exports remain covered. ASan/UBSan, the full native suite including TSan and actual Metal checks pass (`perf-native.log`); build 9 signs successfully. Device performance comparison and user acceptance are still pending.
+
+- Build 9 was installed and its actual boot log identifies `Hayarigami build 9 start`; no STOP/SIGNAL appeared in the inspected current-run log. A second detached 10-second Time Profiler recording (`device-build9-performance.trace`) no longer lists export scanning among its leading hot paths. It sampled the first-generation loading/intro path, whereas build 8 sampled story play, so the total sample counts are not a controlled same-scene FPS comparison.
+- The user explicitly reported **明显改善** while playing build 9 without LLDB attached. This validates a noticeable improvement, not a measured 60 FPS guarantee. Remaining samples include linear video texture uploads, shader/resource setup and synchronous GPU submission; no additional speculative rendering changes were bundled. Manual save/reload and cold-launch verification remain pending.
+
+- Build 9 candidate IPA export passed strict/deep App signature checks, matching bundle/profile and unexpired provisioning, and all ZIP entry CRCs: 553 files, 4,202,261,113 bytes, SHA-256 `9a0c3c20b78bdd05dcd09a77b90ce269bc1dc49d83b000c5200335cb6c954606`. The archive is local-only; the tested installation source is the same signed App. Provisioning expires 2026-10-27 09:00:50 UTC. The phone registry confirms bundle version 9. All 22 Python unit tests pass.
+- Read-only device copies of Documents/Save completed successfully but contained no files before the requested manual save. This does not validate save/reload; awaiting an actual in-game manual save before terminating the running game.

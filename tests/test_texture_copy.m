@@ -11,6 +11,7 @@ int main(int argc,char **argv) {
         assert(!posix_memalign(&memory,0x4000,0x8000));memset(memory,0,0x8000);
         PoolBuilder pb={.device=&d,.storage=memory,.size=0x8000,.flags=0x24};Pool *pool=NULL;assert(pool_initialize(&pool,&pb));
         TextureBuilder tb={.device=&d};texture_defaults(&tb);texture_size2d(&tb,19,17);texture_format(&tb,0x25);texture_storage(&tb,&pool,0);
+        if(argc>1 && !strcmp(argv[1],"--reject-linear-destination")){texture_format(&tb,1);texture_flags(&tb,0x10);texture_stride(&tb,32);}
         Texture source,destination;assert(texture_initialize(&source,&tb));texture_size2d(&tb,24,24);texture_storage(&tb,&pool,0x2000);assert(texture_initialize(&destination,&tb));
         HyCommands c;assert(command_initialize(&c,&d));command_memory(&c,&pool,0x4000,0x1000);hy_commands_begin(&c);
         HyCopyRegion from={1,2,0,5,6,1},to={3,4,0,5,6,1};

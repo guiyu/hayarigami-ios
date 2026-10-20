@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
         view_defaults(bounded_view); view_levels(bounded_view,0,1); view_layers(bounded_view,0,1);
         view_format(bounded_view,0x25); view_target(bounded_view,1); view_depth_mode(bounded_view,0);
         view_swizzle(bounded_view,2,3,4,5);
-        for (size_t i=32;i<sizeof view_storage;i++) assert(view_storage[i]==0xa5);
+        for (size_t i=16;i<sizeof view_storage;i++) assert(view_storage[i]==0xa5);
         initialize(NULL, 0);
         void *memory = NULL; assert(!posix_memalign(&memory, 0x4000, 0x8000));
         uint8_t *bytes = memory;

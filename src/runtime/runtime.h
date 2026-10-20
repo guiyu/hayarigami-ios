@@ -12,6 +12,8 @@ typedef struct {
     uint64_t dynamic[32];
     HySymbol *symbols;
     size_t symbol_count;
+    HySymbol **symbol_index;
+    size_t export_count;
     const char *strings;
 } HyModule;
 extern HyModule hy_modules[4];
@@ -29,6 +31,9 @@ void *hy_input_service(const char *name);
 void *hy_account_service(const char *name);
 int hy_account_user_valid(const void *uid);
 void hy_input_set(uint64_t buttons, int connected);
+void hy_graphics_attach_layer(void *layer);
+void hy_graphics_set_active(int active);
+void hy_movie_set_active(int active);
 void hy_filesystem_init(const char *romfs);
 void *hy_filesystem_service(const char *name);
 void hy_load(const char *directory, int fixture);

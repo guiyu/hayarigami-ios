@@ -7,7 +7,7 @@ xcrun clang -D_DARWIN_C_SOURCE -std=c11 -Wall -Wextra -Werror -O1 -g -arch arm64
     "$ROOT/src/runtime/loader.c" "$ROOT/src/runtime/kernel.c" \
     "$ROOT/src/runtime/account.c" "$ROOT/src/runtime/services.c" "$ROOT/src/runtime/input.c" \
     "$ROOT/src/runtime/threads.c" "$ROOT/src/runtime/filesystem.c" "$ROOT/src/runtime/gate.S" \
-    "$ROOT/src/audio/renderer.c" "$ROOT/src/audio/output.c" "$ROOT/src/audio/mix.c" -framework AudioToolbox \
-    "$ROOT/src/gfx/platform.m" "$ROOT/src/gfx/bc7.c" "$ROOT/src/gfx/nvn_tex.c" "$ROOT/src/gfx/nvn_deswizzle.c" \
-    "$ROOT/.local/gfx-generated/nvn_names.c" "$ROOT/.local/gfx-generated/nvn_gates.S" -framework Metal -framework Foundation -framework QuartzCore \
+    "$ROOT/src/audio/renderer.c" "$ROOT/src/audio/output.c" "$ROOT/src/audio/pcm.c" "$ROOT/src/audio/mix.c" -framework AudioToolbox \
+    "$ROOT/src/media/decoder.m" "$ROOT/src/gfx/platform.m" "$ROOT/src/gfx/bc7.c" "$ROOT/src/gfx/nvn_tex.c" "$ROOT/src/gfx/nvn_deswizzle.c" \
+    "$ROOT/.local/gfx-generated/nvn_names.c" "$ROOT/.local/gfx-generated/nvn_gates.S" -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework Metal -framework Foundation -framework QuartzCore \
     "$ROOT/tests/probe_audio.c" -o "$ROOT/.local/runtime/probe-audio"

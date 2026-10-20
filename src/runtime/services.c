@@ -20,6 +20,20 @@ static unsigned focus_state(void) { return 1; }
 static unsigned resolution(int *width, int *height) { *width = 1280; *height = 720; return 0; }
 static void performance(unsigned mode, unsigned configuration) { (void)mode; (void)configuration; }
 static int pop_notification(unsigned *message) { (void)message; return 0; }
+// Native UIKit owns termination; there is no guest applet exit-request source.
+// Preserve the SDK's process-wide nesting contract without opening its IPC object.
+static pthread_mutex_t exit_section_lock=PTHREAD_MUTEX_INITIALIZER;
+static unsigned exit_sections;
+static void enter_exit_section(void) {
+    pthread_mutex_lock(&exit_section_lock);
+    if(exit_sections==UINT32_MAX)hy_fail("exit section nesting overflow");
+    exit_sections++;pthread_mutex_unlock(&exit_section_lock);
+}
+static void leave_exit_section(void) {
+    pthread_mutex_lock(&exit_section_lock);
+    if(!exit_sections)hy_fail("unmatched exit section leave");
+    exit_sections--;pthread_mutex_unlock(&exit_section_lock);
+}
 static void fs_allocator(void *allocate, void *release) { (void)allocate; (void)release; /* Host-owned handles use host allocation. */ }
 static void ro_init(void) { fputs("host module registry: main, subsdk0, sdk\n", stderr); }
 static unsigned network_init(void) { fputs("host network: offline\n",stderr); return 0; }
@@ -33,12 +47,18 @@ static unsigned calendar_time(Calendar *out, CalendarInfo *info, const int64_t *
     if (!localtime_r(&value, &tm)) return 0xfa01;
     *out = (Calendar){tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, 0};
     if (info) { memset(info, 0, sizeof *info); info->weekday = tm.tm_wday; info->yearday = tm.tm_yday;
-        info->dst = tm.tm_isdst > 0; info->offset = tm.tm_gmtoff; strlcpy(info->zone, tm.tm_zone ? tm.tm_zone : "UTC", sizeof info->zone); }
+        info->dst = tm.tm_isdst > 0; info->offset = (int32_t)tm.tm_gmtoff; strlcpy(info->zone, tm.tm_zone ? tm.tm_zone : "UTC", sizeof info->zone); }
     return 0;
 }
 void *hy_service(const char *name) {
+    extern void *hy_movie_service(const char *name);
+    void *movie=hy_movie_service(name);
+    if(movie)return movie;
     void *graphics = hy_graphics_service(name);
     if (graphics) return graphics;
+    extern void *hy_pcm_service(const char *name);
+    void *pcm=hy_pcm_service(name);
+    if(pcm)return pcm;
     void *audio = hy_audio_service(name);
     if (audio) return audio;
     void *account=hy_account_service(name);
@@ -61,6 +81,8 @@ void *hy_service(const char *name) {
         {"_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", (void *)resolution},
         {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", (void *)performance},
         {"_ZN2nn2oe25TryPopNotificationMessageEPj", (void *)pop_notification},
+        {"_ZN2nn2oe31EnterExitRequestHandlingSectionEv", (void *)enter_exit_section},
+        {"_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", (void *)leave_exit_section},
         {"_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", (void *)fs_allocator},
         {"_ZN2nn2ro10InitializeEv", (void *)ro_init},
         {"_ZN2nn4nifm10InitializeEv", (void *)network_init},

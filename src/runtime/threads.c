@@ -4,6 +4,8 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <string.h>
+#include <setjmp.h>
 
 typedef struct {
     pthread_t pthread;
@@ -11,10 +13,15 @@ typedef struct {
     uintptr_t entry, argument, stack, wait_address, condition_key;
     uint32_t handle, wait_tag, wait_result;
     int priority, core, started, exited, waiting;
+    unsigned wait_references;
+    int cancel_pending;
     uint64_t core_mask;
+    jmp_buf host_return;
+    int host_return_ready;
 } Thread;
 static Thread *threads[64];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t exit_changed=PTHREAD_COND_INITIALIZER;
 static pthread_key_t current_key;
 extern _Noreturn void hy_thread_enter(uintptr_t, uintptr_t, uintptr_t);
 static Thread *get(uint32_t handle) {
@@ -32,13 +39,19 @@ void hy_thread_main(void) {
 }
 _Noreturn void hy_thread_returned(void) {
     Thread *t = pthread_getspecific(current_key);
-    pthread_mutex_lock(&lock); t->exited = 1; pthread_cond_broadcast(&t->changed); pthread_mutex_unlock(&lock);
+    if(t->host_return_ready)longjmp(t->host_return,1);
+    pthread_mutex_lock(&lock); t->exited = 1; pthread_cond_broadcast(&t->changed);pthread_cond_broadcast(&exit_changed); pthread_mutex_unlock(&lock);
     pthread_exit(NULL);
 }
 static void *run(void *argument) {
     Thread *t = argument;
     pthread_setspecific(current_key, t); hy_thread_init();
-    hy_thread_enter(t->entry, t->argument, t->stack);
+    t->host_return_ready=1;
+    if(!setjmp(t->host_return))hy_thread_enter(t->entry, t->argument, t->stack);
+    // The guest may unmap its stack as soon as the exit wait is signaled.
+    // Restore our native stack before publishing exit or running pthread cleanup.
+    pthread_mutex_lock(&lock);t->exited=1;pthread_cond_broadcast(&t->changed);pthread_cond_broadcast(&exit_changed);pthread_mutex_unlock(&lock);
+    return NULL;
 }
 // Called with the host registry lock held. Transfer guest mutex ownership
 // before waking its waiter; an unlocked interval would allow a lost handoff.
@@ -114,12 +127,54 @@ int hy_thread_syscall(unsigned number, uint64_t *r) {
         pthread_mutex_lock(&lock); Thread *t = pthread_getspecific(current_key);
         r[0] = t->core < 0 ? 0 : t->core; pthread_mutex_unlock(&lock); return 1;
     }
+    case 0x18: {
+        int count=(int)r[2];int64_t timeout=(int64_t)r[3];uint32_t handles[64];
+        if(count<0 || count>64 || (count && !r[1])) {r[0]=0xfa01;return 1;}
+        if(count)memcpy(handles,(const void *)(uintptr_t)r[1],(size_t)count*sizeof *handles);
+        struct timespec deadline;clock_gettime(CLOCK_MONOTONIC,&deadline);
+        if(timeout>0) {deadline.tv_sec+=timeout/1000000000;deadline.tv_nsec+=timeout%1000000000;deadline.tv_sec+=deadline.tv_nsec/1000000000;deadline.tv_nsec%=1000000000;}
+        pthread_mutex_lock(&lock);uint32_t result=0;int index=-1;Thread *targets[64];
+        for(int i=0;i<count;i++) {targets[i]=get(handles[i]);if(!targets[i])result=0xe401;}
+        if(result) {pthread_mutex_unlock(&lock);r[0]=result;r[1]=UINT32_MAX;return 1;}
+        for(int i=0;i<count;i++)targets[i]->wait_references++;
+        Thread *self=pthread_getspecific(current_key);
+        for(;;) {
+            if(self && self->cancel_pending) {self->cancel_pending=0;result=0xec01;break;}
+            for(int i=0;i<count;i++)if(targets[i]->exited) {index=i;break;}
+            if(index>=0)break;
+            if(!timeout) {result=0xea01;break;}
+            int code;
+            if(timeout<0)code=pthread_cond_wait(&exit_changed,&lock);
+            else {
+                struct timespec now,remaining;clock_gettime(CLOCK_MONOTONIC,&now);
+                remaining.tv_sec=deadline.tv_sec-now.tv_sec;remaining.tv_nsec=deadline.tv_nsec-now.tv_nsec;
+                if(remaining.tv_nsec<0) {remaining.tv_sec--;remaining.tv_nsec+=1000000000;}
+                code=remaining.tv_sec<0 ? ETIMEDOUT : pthread_cond_timedwait_relative_np(&exit_changed,&lock,&remaining);
+            }
+            if(code==ETIMEDOUT) {result=0xea01;break;}
+            if(code)hy_fail("thread exit wait failed");
+        }
+        for(int i=0;i<count;i++)targets[i]->wait_references--;pthread_cond_broadcast(&exit_changed);
+        pthread_mutex_unlock(&lock);r[0]=result;r[1]=(uint32_t)index;return 1;
+    }
+    case 0x19: {
+        pthread_mutex_lock(&lock);Thread *target=get((uint32_t)r[0]);
+        if(target){target->cancel_pending=1;pthread_cond_broadcast(&exit_changed);r[0]=0;}else r[0]=0xe401;
+        pthread_mutex_unlock(&lock);return 1;
+    }
+    case 0x16: {
+        uint32_t handle=(uint32_t)r[0];pthread_mutex_lock(&lock);Thread *t=get(handle);
+        if(!t || handle==0xffff8000 || !t->started || !t->exited) {pthread_mutex_unlock(&lock);return 0;}
+        threads[handle-0x100]=NULL;pthread_cond_broadcast(&exit_changed);
+        while(t->wait_references)pthread_cond_wait(&exit_changed,&lock);pthread_mutex_unlock(&lock);
+        if(pthread_join(t->pthread,NULL))hy_fail("thread close join failed");pthread_cond_destroy(&t->changed);free(t);r[0]=0;return 1;
+    }
     case 0x1a: {
         Thread *t = pthread_getspecific(current_key);
         _Atomic uint32_t *word = (_Atomic uint32_t *)(uintptr_t)r[1];
         pthread_mutex_lock(&lock);
         if (atomic_load(word) == ((uint32_t)r[0] | 0x40000000)) {
-            t->wait_address = r[1]; t->wait_tag = r[2]; t->waiting = 1;
+            t->wait_address = r[1]; t->wait_tag = (uint32_t)r[2]; t->waiting = 1;
             while (t->waiting) pthread_cond_wait(&t->changed, &lock);
         }
         pthread_mutex_unlock(&lock); r[0] = 0; return 1;
@@ -138,7 +193,7 @@ int hy_thread_syscall(unsigned number, uint64_t *r) {
         int64_t ns=(int64_t)r[3];
         if (!ns) result=0xea01;
         else {
-            t->wait_address=r[0]; t->condition_key=r[1]; t->wait_tag=r[2];
+            t->wait_address=r[0]; t->condition_key=r[1]; t->wait_tag=(uint32_t)r[2];
             t->wait_result=0; t->waiting=3;
             struct timespec deadline; clock_gettime(CLOCK_MONOTONIC,&deadline);
             if (ns>0) { deadline.tv_sec+=ns/1000000000; deadline.tv_nsec+=ns%1000000000;
@@ -219,7 +274,7 @@ int hy_thread_syscall(unsigned number, uint64_t *r) {
         pthread_mutex_lock(&lock);
         unsigned waiting = 0;
         for (size_t i = 0; i < 64; i++) if (threads[i] && threads[i]->waiting == 2 && threads[i]->wait_address == r[0]) waiting++;
-        uint32_t result = 0, expected = r[2]; int count = (int)r[3];
+        uint32_t result = 0, expected = (uint32_t)r[2]; int count = (int)r[3];
         if (r[1]) {
             uint32_t next = expected + 1;
             if (r[1] == 2 && waiting) next = count <= 0 || waiting <= (unsigned)count ? expected - 1 : expected;
