@@ -171,9 +171,55 @@ static uint32_t pool_initialize(Pool **object, const PoolBuilder *b) {
     }
     return 1;
 }
+// Resource leases belong to recorded bytes, not the reusable command-builder object.
+// Release any old lease touched by a new record, including partial overwrites.
+@protocol HyPoolReference
+- (BOOL)usesPool:(Pool *)pool;
+@end
+@interface HyCommandLease : NSObject {
+@public uintptr_t begin, end; id resource;
+}
+@end
+@implementation HyCommandLease
+@end
+static NSMutableArray<HyCommandLease *> *command_leases;
+static pthread_mutex_t command_lock=PTHREAD_MUTEX_INITIALIZER;
+static void command_overwrite(void *address,size_t size) {
+    uintptr_t begin=(uintptr_t)address;
+    if (size>UINTPTR_MAX-begin) hy_fail("command range overflow");
+    uintptr_t end=begin+size;
+    pthread_mutex_lock(&command_lock);
+    for (NSUInteger i=command_leases.count;i>0;i--) {
+        HyCommandLease *lease=command_leases[i-1];
+        if (begin<lease->end && lease->begin<end) [command_leases removeObjectAtIndex:i-1];
+    }
+    pthread_mutex_unlock(&command_lock);
+}
+static void command_release_pool(Pool *pool) {
+    uintptr_t begin=(uintptr_t)pool->storage,end=begin+pool->size;
+    pthread_mutex_lock(&command_lock);
+    for (NSUInteger i=command_leases.count;i>0;i--) {
+        HyCommandLease *lease=command_leases[i-1];
+        BOOL dependency=[lease->resource respondsToSelector:@selector(usesPool:)] &&
+            [(id<HyPoolReference>)lease->resource usesPool:pool];
+        if (dependency || (begin<lease->end && lease->begin<end)) [command_leases removeObjectAtIndex:i-1];
+    }
+    pthread_mutex_unlock(&command_lock);
+}
+static void command_keep(void *payload,size_t size,id resource) {
+    HyCommandLease *lease=[HyCommandLease new];
+    lease->begin=(uintptr_t)payload-8;lease->end=lease->begin+((size+15)&~(size_t)7);lease->resource=resource;
+    pthread_mutex_lock(&command_lock);
+    if (!command_leases) command_leases=[NSMutableArray new];
+    [command_leases addObject:lease];pthread_mutex_unlock(&command_lock);
+}
+static uint32_t command_initialize(HyCommands *c,void *d) {
+    uint32_t result=hy_commands_init(c,d);c->overwrite=command_overwrite;return result;
+}
 static void pool_finalize(Pool **object) {
     Pool *p = *object;
     if (!p) hy_fail("invalid NVN memory pool finalize");
+    command_release_pool(p);
     if (p->textures || p->buffers) hy_fail("memory pool finalized with live resources");
     pthread_mutex_lock(&pools_lock);
     Pool **slot=&pools; while (*slot && *slot!=p) slot=&(*slot)->next;
@@ -396,6 +442,42 @@ static void command_memory(HyCommands *c, Pool *const *object, ptrdiff_t offset,
         hy_fail("command memory outside pool");
     hy_commands_memory(c, (uint8_t *)p->storage + offset, size);
 }
+@interface HyBoundBuffer : NSObject <HyPoolReference> {
+@public Pool *pool; id<MTLBuffer> buffer; size_t offset,length; int stage,index;
+}
+@end
+@implementation HyBoundBuffer
+- (BOOL)usesPool:(Pool *)other { return pool==other; }
+- (void)dealloc {
+    if (pool) { pthread_mutex_lock(&pool->lock);pool->buffers--;pthread_mutex_unlock(&pool->lock); }
+}
+@end
+static void command_uniform(HyCommands *c,int stage,int index,uint64_t address,size_t length) {
+    if (stage<0 || stage>5 || index<0 || index>=32) hy_fail("unsupported uniform stage/index");
+    HyBoundBuffer *bound=[HyBoundBuffer new];bound->stage=stage;bound->index=index;bound->length=length;
+    if (length) {
+        pthread_mutex_lock(&pools_lock);
+        for (Pool *p=pools;p;p=p->next) {
+            uint64_t base=(uintptr_t)p->storage;
+            if (address>=base && address-base<=p->size && length<=p->size-(address-base)) {
+                bound->pool=p;bound->buffer=(__bridge id<MTLBuffer>)p->buffer;
+                bound->offset=p->offset+(size_t)(address-base);
+                pthread_mutex_lock(&p->lock);p->buffers++;pthread_mutex_unlock(&p->lock);break;
+            }
+        }
+        pthread_mutex_unlock(&pools_lock);
+        if (!bound->pool) hy_fail("uniform buffer outside live memory pools");
+    }
+    void *value=(__bridge void *)bound;void *record=hy_commands_record(c,HY_UNIFORM_BUFFER,sizeof value);
+    memcpy(record,&value,sizeof value);command_keep(record,sizeof value,bound);
+}
+static void command_program(HyCommands *c,void *const *object,uint32_t stages) {
+    if ((stages&~63u) || (object && !*object)) hy_fail("invalid bound program/stages");
+    NSArray *shaders=object ? (__bridge NSArray *)*object : @[];
+    HyProgramRecord *record=hy_commands_record(c,HY_BIND_PROGRAM,sizeof *record);
+    *record=(HyProgramRecord){(__bridge void *)shaders,stages};
+    command_keep(record,sizeof *record,shaders);
+}
 static void command_counter(HyCommands *c, int type, uint64_t address) {
     if (type!=0 && type!=16) hy_fail("counter type not implemented: %d",type);
     if (address&7) hy_fail("unaligned counter destination");
@@ -602,7 +684,7 @@ static Descriptor *descriptor_slot(const DescriptorPool *pool, int index) {
     if (!pool->pool || index<0 || index>=pool->count) hy_fail("NVN descriptor index out of range");
     return (Descriptor *)((uint8_t *)pool->pool->storage+pool->offset)+(size_t)index;
 }
-static void register_texture(const DescriptorPool *pool, int index, const Texture *t, const TextureView *view) {
+static id<MTLTexture> texture_view(const Texture *t,const TextureView *view) {
     if (!t || !t->image) hy_fail("registering invalid texture");
     id<MTLTexture> image=(__bridge id<MTLTexture>)t->image;
     if (view) {
@@ -621,6 +703,10 @@ static void register_texture(const DescriptorPool *pool, int index, const Textur
             if (!image) hy_fail("Metal texture view creation failed");
         }
     }
+    return image;
+}
+static void register_texture(const DescriptorPool *pool, int index, const Texture *t, const TextureView *view) {
+    id<MTLTexture> image=texture_view(t,view);
     Descriptor *slot=descriptor_slot(pool,index);
     pthread_mutex_lock(&t->backing->pool->lock);
     t->backing->references++;
@@ -628,6 +714,42 @@ static void register_texture(const DescriptorPool *pool, int index, const Textur
     id previous=(__bridge_transfer id)slot->resource; (void)previous;
     backing_release(slot->view);
     slot->resource=(__bridge_retained void *)image; slot->view=t->backing;
+}
+@interface HyTargetImage : NSObject {
+@public id<MTLTexture> image; TextureBacking *backing;
+}
+@end
+@implementation HyTargetImage
+- (void)dealloc { backing_release(backing); }
+@end
+@interface HyRenderTargets : NSObject <HyPoolReference> {
+@public NSArray *colors; HyTargetImage *depth;
+}
+@end
+@implementation HyRenderTargets
+- (BOOL)usesPool:(Pool *)pool {
+    if (depth && depth->backing->pool==pool) return YES;
+    for (id color in colors) if (color!=[NSNull null] && ((HyTargetImage *)color)->backing->pool==pool) return YES;
+    return NO;
+}
+@end
+static HyTargetImage *target_image(const Texture *texture,const TextureView *view,int depth) {
+    id<MTLTexture> image=texture_view(texture,view);
+    if (!(image.usage&MTLTextureUsageRenderTarget) || image.mipmapLevelCount!=1 ||
+        ((texture->builder.format==0x34 || texture->builder.format==0x36)!=!!depth))
+        hy_fail("unsupported render target format/view");
+    HyTargetImage *snapshot=[HyTargetImage new];snapshot->image=image;snapshot->backing=texture->backing;
+    pthread_mutex_lock(&snapshot->backing->pool->lock);snapshot->backing->references++;
+    pthread_mutex_unlock(&snapshot->backing->pool->lock);return snapshot;
+}
+static void command_targets(HyCommands *c,int count,Texture *const *textures,const TextureView *const *views,
+                            const Texture *depth,const TextureView *depth_view) {
+    if (count<0 || count>8 || (count && !textures)) hy_fail("invalid render target count");
+    HyRenderTargets *targets=[HyRenderTargets new];NSMutableArray *colors=[NSMutableArray new];
+    for (int i=0;i<count;i++) [colors addObject:textures[i] ? target_image(textures[i],views ? views[i] : NULL,0) : (id)[NSNull null]];
+    targets->colors=[colors copy];if (depth) targets->depth=target_image(depth,depth_view,1);
+    void *value=(__bridge void *)targets;void *record=hy_commands_record(c,HY_RENDER_TARGETS,sizeof value);
+    memcpy(record,&value,sizeof value);command_keep(record,sizeof value,targets);
 }
 static void descriptor_finalize(DescriptorPool *pool) {
     for (int i=0;i<pool->count;i++) {
@@ -819,11 +941,22 @@ static void *lookup(const char *name) {
         {"nvnCommandBufferSetDepthClamp", hy_commands_depth_clamp},
         {"nvnCommandBufferSetViewport", hy_commands_viewport},
         {"nvnCommandBufferSetScissor", hy_commands_scissor},
+        {"nvnCommandBufferClearColor", hy_commands_clear_color},
+        {"nvnCommandBufferClearDepthStencil", hy_commands_clear_depth_stencil},
         {"nvnCommandBufferSetTexturePool", command_texture_pool}, {"nvnCommandBufferSetSamplerPool", command_sampler_pool},
         {"nvnCommandBufferBindMultisampleState", command_multisample}, {"nvnCommandBufferBindColorState", command_color},
         {"nvnCommandBufferBindBlendState", command_blend}, {"nvnCommandBufferBindChannelMaskState", command_channels},
         {"nvnCommandBufferBindPolygonState", command_polygon}, {"nvnCommandBufferBindDepthStencilState", command_depth_stencil},
-        {"nvnCommandBufferInitialize", hy_commands_init},
+        {"nvnCommandBufferInitialize", command_initialize},
+        {"nvnCommandBufferSetRenderTargets", command_targets},
+        {"nvnCommandBufferBindProgram", command_program},
+        {"nvnCommandBufferBindUniformBuffer", command_uniform},
+        {"nvnCommandBufferSetStencilMask", hy_commands_stencil_mask},
+        {"nvnCommandBufferSetStencilValueMask", hy_commands_stencil_value_mask},
+        {"nvnCommandBufferSetAlphaRef", hy_commands_alpha_ref},
+        {"nvnCommandBufferSetStencilRef", hy_commands_stencil_ref},
+        {"nvnCommandBufferBindVertexAttribState", hy_commands_attributes},
+        {"nvnCommandBufferBindVertexStreamState", hy_commands_streams},
         {"nvnCommandBufferSetMemoryCallback", hy_commands_callback}, {"nvnCommandBufferSetMemoryCallbackData", hy_commands_context},
         {"nvnCommandBufferAddCommandMemory", command_memory}, {"nvnCommandBufferAddControlMemory", hy_commands_control},
         {"nvnCommandBufferBeginRecording", hy_commands_begin}, {"nvnCommandBufferEndRecording", hy_commands_end},

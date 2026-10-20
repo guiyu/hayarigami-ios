@@ -19,6 +19,7 @@ compile_run vertex tests/test_vertex_state.c
 compile_run input tests/test_input.c
 compile_run account tests/test_account.c
 compile_run shader-layout tests/test_shader_layout.c
+compile_run loader-symbols tests/test_loader_symbols.c
 compile_run commands tests/test_commands.c
 compile_run texture-layout tests/test_texture_layout.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
@@ -87,6 +88,16 @@ for rejected in code-range stage; do
         esac
     fi
 done
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
+    tests/test_render_targets.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/render-targets"
+"$OUT/render-targets"
+if "$OUT/render-targets" --reject-uniform-range > "$OUT/uniform-reject.log" 2>&1; then
+    echo 'FAIL: out-of-range uniform buffer accepted' >&2;exit 1
+else
+    check_rc=$?;test "$check_rc" -eq 42
+    rg -q 'uniform buffer outside live memory pools' "$OUT/uniform-reject.log"
+fi
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_bc7_metal.m src/gfx/bc7.c \
     -framework Metal -framework Foundation -o "$OUT/bc7-metal"
 "$OUT/bc7-metal"

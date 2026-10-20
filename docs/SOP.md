@@ -58,9 +58,9 @@ sh scripts/build_resource_reader.sh
 
 参考工具变化后脚本拒绝沿用旧审计；重新审查变更再产生新审计文件。没有 vendoring 整个 D2R 工程，未来独立化运行时之前仍需这个只读工具依赖。仅记录 Git commit 不足以识别本地工具，故同时检查文件 SHA-256。
 
-通过后 `candidate/Guest.framework/Guest` 是实验性 iOS Mach-O 容器。`file` 与 `xcrun vtool -show-build` 可检查架构和平台。它没有宿主、重定位后的实际运行状态、GPU 翻译、签名或应用入口，不是安装产物。
+通过后 `candidate/Guest.framework/Guest` 是实验性 iOS Mach-O 容器。`file` 与 `xcrun vtool -show-build` 可检查架构和平台。它没有应用宿主与可玩性验收；新版可能带链接器式 ad-hoc 签名区，但仍没有适配 App 身份的分发签名，不是安装产物。
 
-本次完整复跑的结果位于 `.local/repro-rewrite/`；初始分析为 `.local/run1/report.json`，参考审计为 `.local/audit.json`。
+初次完整复跑保留在 `.local/repro-rewrite/`。2026-10-20 新分析为 `.local/analysis-upstream-20261020/report.json`，新工具审计为 `.local/audit-upstream-20261020.json`，等价试验与容器为 `.local/rewrite-upstream-20261020/`；新旧模块字节相同。后续诊断启动可直接使用新目录。
 
 ## 后续真机阶段的进入条件
 
@@ -70,7 +70,7 @@ sh scripts/build_resource_reader.sh
 4. 只有到此阶段才通知用户连接 iPhone，核对待安装的是新 App。禁止卸载/替换暗黑、迁移或触碰旧存档。
 5. 安装后分别记录：能启动、真实标题画面、进入剧情、选项/音频/影片、保存退出与恢复、后台恢复及持续运行。没有完成的项目标为未验证。
 
-Personal Team 可用性和实际签名期限以到时 Xcode 返回结果为准；本次未创建签名、未检查设备、未安装。
+Personal Team 可用性和实际签名期限以到时 Xcode 返回结果为准；尚未使用个人证书签名、未检查设备、未安装；本地容器的 ad-hoc 重签测试不属于这些验收。
 ## 原生运行时增量复跑
 
 在仓库根目录执行（所有输出仍在 `.local/`）：

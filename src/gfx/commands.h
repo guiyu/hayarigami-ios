@@ -5,13 +5,17 @@
 typedef struct { uint32_t op, size; } HyRecord;
 enum { HY_BEGIN = 1, HY_END, HY_JUMP, HY_TEXTURE_POOL, HY_SAMPLER_POOL,
     HY_MULTISAMPLE_STATE, HY_COLOR_STATE, HY_BLEND_STATE, HY_CHANNEL_MASK_STATE,
-    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER, HY_DEPTH_RANGE, HY_DEPTH_CLAMP, HY_VIEWPORT, HY_SCISSOR };
+    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER, HY_DEPTH_RANGE, HY_DEPTH_CLAMP, HY_VIEWPORT, HY_SCISSOR, HY_RENDER_TARGETS, HY_CLEAR_COLOR, HY_CLEAR_DEPTH, HY_BIND_PROGRAM, HY_UNIFORM_BUFFER, HY_STENCIL_MASK, HY_STENCIL_VALUE_MASK, HY_ALPHA_REF, HY_STENCIL_REF, HY_VERTEX_ATTRIBUTES, HY_VERTEX_STREAMS };
 typedef struct { uint64_t address; int type; } HyCounterRecord;
+typedef struct { int32_t index; uint32_t mask; float color[4]; } HyClearColorRecord;
+typedef struct { void *shaders; uint32_t stages; } HyProgramRecord;
+typedef struct { float depth; uint32_t depth_mask; int32_t stencil; uint32_t stencil_mask; } HyClearDepthRecord;
 typedef struct HyCommands HyCommands;
 typedef void (*HyMemoryCallback)(HyCommands *, int, size_t, void *);
 struct HyCommands {
     void *device, *context;
     HyMemoryCallback callback;
+    void (*overwrite)(void *,size_t);
     uint8_t *memory, *begin;
     size_t size, used;
     void *control;
@@ -29,6 +33,7 @@ static inline void hy_commands_memory(HyCommands *c, void *memory, size_t size) 
         hy_fail("invalid command memory size/alignment");
     if (c->recording && c->memory) {
         if (c->size - c->used < 16) hy_fail("command jump reservation exhausted");
+        if (c->overwrite) c->overwrite(c->memory+c->used,16);
         HyRecord jump = {HY_JUMP, 16};
         memcpy(c->memory + c->used, &jump, sizeof jump);
         memcpy(c->memory + c->used + 8, &memory, sizeof memory);
@@ -47,6 +52,7 @@ static inline void *hy_commands_record(HyCommands *c, uint32_t op, size_t bytes)
         c->callback(c, 0, size + 16, c->context);
     }
     uint8_t *p = c->memory + c->used;
+    if (c->overwrite) c->overwrite(p,size);
     HyRecord header = {op, (uint32_t)size}; memcpy(p, &header, 8);
     memset(p + 8, 0, size - 8); c->used += size;
     return p + 8;
@@ -62,6 +68,40 @@ static inline void hy_commands_viewport(HyCommands *c, int32_t x, int32_t y, int
 }
 static inline void hy_commands_scissor(HyCommands *c, int32_t x, int32_t y, int32_t width, int32_t height) {
     int32_t rect[]={x,y,width,height}; memcpy(hy_commands_record(c,HY_SCISSOR,sizeof rect),rect,sizeof rect);
+}
+static inline void hy_commands_clear_color(HyCommands *c,int index,const float *color,uint32_t mask) {
+    if (index<0 || index>=8 || (mask&~15u) || !color) hy_fail("invalid color clear");
+    HyClearColorRecord *record=hy_commands_record(c,HY_CLEAR_COLOR,sizeof *record);
+    record->index=index;record->mask=mask;memcpy(record->color,color,sizeof record->color);
+}
+static inline void hy_commands_clear_depth_stencil(HyCommands *c,float depth,uint32_t depth_mask,int32_t stencil,uint32_t stencil_mask) {
+    HyClearDepthRecord *record=hy_commands_record(c,HY_CLEAR_DEPTH,sizeof *record);
+    *record=(HyClearDepthRecord){depth,!!(depth_mask&255),stencil,stencil_mask};
+}
+static inline void hy_commands_stencil_mask(HyCommands *c,uint32_t faces,uint32_t mask) {
+    if (faces&~3u) hy_fail("invalid stencil face mask");
+    uint32_t state[]={faces,mask&255};memcpy(hy_commands_record(c,HY_STENCIL_MASK,sizeof state),state,sizeof state);
+}
+static inline void hy_commands_stencil_value_mask(HyCommands *c,uint32_t faces,uint32_t mask) {
+    if (faces&~3u) hy_fail("invalid stencil face mask");
+    uint32_t state[]={faces,mask&255};memcpy(hy_commands_record(c,HY_STENCIL_VALUE_MASK,sizeof state),state,sizeof state);
+}
+static inline void hy_commands_alpha_ref(HyCommands *c,float reference) {
+    memcpy(hy_commands_record(c,HY_ALPHA_REF,sizeof reference),&reference,sizeof reference);
+}
+static inline void hy_commands_stencil_ref(HyCommands *c,uint32_t faces,uint32_t reference) {
+    if (faces&~3u) hy_fail("invalid stencil face mask");
+    uint32_t state[]={faces,reference&255};memcpy(hy_commands_record(c,HY_STENCIL_REF,sizeof state),state,sizeof state);
+}
+static inline void hy_commands_attributes(HyCommands *c,int count,const uint32_t *attributes) {
+    if (count<0 || count>16 || (count && !attributes)) hy_fail("unsupported vertex attribute count");
+    uint32_t *record=hy_commands_record(c,HY_VERTEX_ATTRIBUTES,8+(size_t)count*4);
+    record[0]=(uint32_t)count;if (count) memcpy(record+2,attributes,(size_t)count*4);
+}
+static inline void hy_commands_streams(HyCommands *c,int count,const void *streams) {
+    if (count<0 || count>16 || (count && !streams)) hy_fail("unsupported vertex stream count");
+    uint32_t *record=hy_commands_record(c,HY_VERTEX_STREAMS,8+(size_t)count*8);
+    record[0]=(uint32_t)count;if (count) memcpy(record+2,streams,(size_t)count*8);
 }
 static inline void hy_commands_begin(HyCommands *c) {
     if (c->recording) hy_fail("nested NVN command recording");

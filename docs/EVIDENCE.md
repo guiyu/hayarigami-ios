@@ -41,7 +41,7 @@ main 的 build ID 全为零，因此不能用它唯一识别版本，复跑校�
 
 ## 离线改写验证
 
-参考工程当前提交 `1156cd4868c0e3e806e00f4eb57674626d242cb7`。仅读取其通用改写器、独立验证工具与 Mach-O 封装工具。新项目先记录工具 SHA-256，再校验输入模块 SHA-256，强制 `DM_RULESET=native`、`DM_PRIVATE_GATES=0`、`PYTHONOPTIMIZE=0`，拒绝非空 cuts/obs/params。
+初次参考工程提交 `1156cd4868c0e3e806e00f4eb57674626d242cb7`。仅读取其通用改写器、独立验证工具与 Mach-O 封装工具。新项目先记录工具 SHA-256，再校验输入模块 SHA-256，强制 `DM_RULESET=native`、`DM_PRIVATE_GATES=0`、`PYTHONOPTIMIZE=0`，拒绝非空 cuts/obs/params。
 
 | 模块 | 结构检查改写点 | 等价试验站点 | 试验次数 | 有效试验 | 故意破坏负例 |
 |---|---:|---:|---:|---:|---:|
@@ -140,3 +140,21 @@ Buffer 映射与地址保留 pool 内偏移；flush 在子范围内验证，仍�
 游戏工作线程新增需要 SVC 0x1c/0x1d 条件变量。独立实现原子解锁、条件等待、通知后重新取得 mutex、有限/零超时；TSan 回归验证锁被持有时不会提前返回。相对超时采用单调截止时间加 Darwin 相对等待，不依赖系统挂钟。行为参照 Atmosphere KConditionVariable，未复制其实现。当前不包含完整优先级继承或线程取消支持。
 
 真实启动已越过上述资源和服务阶段并进入绘图状态命令录制，深度范围与 clamp 仅保存命令；尚无游戏绘图重放、标题画面、App/IPA 或真机安装证据。旧版“停止于 nvnProgramInitialize”是历史停止点，已被本增量取代。
+
+
+## 上游同步与解析复核（2026-10-20）
+
+已对 `jhaizhou-ops/d2r-mobile` 执行 fetch。最新上游为 `53e7c5bb9ca3ea53e2160005be8fbe920cd9cb53`；本地参考 HEAD `ad4e22bc07ca7c290b77fd30fca7e079a0a1cd30` 已包含它，工作区保持干净，不需要重复 merge。原版本审计保留，新审计 `.local/audit-upstream-20261020.json` 固定当前五个工具的 SHA-256。
+
+新版解析保留 ELF symbol binding、visibility、section，并对 MOD0、负 dynamic 偏移、hash 表头、完整 symbol/string 表与 RELA 范围进行检查。新报告四模块的23个未找到模块内定义的符号均为弱导入，强导入0，未知绑定0。此统计仍是静态同名覆盖；不代表已经实现所有 SDK 平台服务。宿主独立合成测试确认缺失弱导入为零、已有客体/宿主定义仍解析、缺失强导入退出42；解析及相关 Python 测试共22例通过。
+
+新上游 x18 寄存器字段预筛选应用于本作四模块，结构检查全部通过。26,515 个站点的81,123次试验、71,627次有效试验无分歧，150个变异负例全部检出。新旧四模块的 patched.bin、fixups.tsv、gates.tsv 逐字节相同：此次更新增加扫描筛选，不改变本作已验证的改写语义。未测量速度倍数。
+
+新 Mach-O 容器为31,838,224字节，增加 LC_CODE_SIGNATURE 与链接器式 ad-hoc 签名预留区。原始预签名未绑定 bundle 资源，不作为完整框架签名验收。在忽略目录的普通名称测试副本上，使用系统 codesign、无个人证书的 ad-hoc 重签后，严格验签通过。`.framework` 目录在当前 FileProvider 路径会被重新附加 FinderInfo，严格签名拒绝；同目录改用普通名称的副本后通过，真实 App 构建仍须使用不带该元数据的打包暂存目录。此测试不证明个人团队签名、zsign、真机安装或iOS代码页映射。
+
+新版产物位于 `.local/rewrite-upstream-20261020/`，原产物没有覆盖。实际启动新版模块已创建游戏纹理并录制渲染目标、颜色及深度模板清屏请求，停在 `nvnCommandBufferBindProgram`。渲染目标持有 view/backing 的快照，命令字节被部分覆盖或资源池释放时回收；合成 Metal/ASan 验证通过。清屏仍仅录制，尚无游戏命令提交重放和标题画面。
+
+
+程序绑定现在持有不可变 shader 数组的命令 lease，原 Program 销毁或替换后仍可用；覆盖旧命令后释放。Uniform buffer 绑定保留 pool、Metal buffer、精确偏移和长度，并保留提交前的数据更新，不拍摄旧数据副本。资源池释放会使存放于其中或依赖该池的旧录制引用失效；跨池释放和越界绑定已通过合成 ASan/Metal 回归。尚不允许执行已因资源销毁失效的旧命令。
+
+已按 SDK ABI 录制模板读/写掩码与参考值、alpha参考值、16组顶点属性与顶点流；后续重放必须处理补足/禁用状态及着色器特化限制。新版模块最新真实启动停止于 `nvnCommandBufferBindVertexBuffers`。最新完整 native 回归（含弱导入、跨池资源、Program绑定）、22例Python与iOS编译均通过；仍未提交游戏绘图、未生成可安装IPA。

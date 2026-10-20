@@ -38,10 +38,18 @@ def nso_info(data):
             raise ValueError('NSO segment hash mismatch')
         hashes.append(dict(sha256=digest.hex(), hash_present=bool(flags >> (i + 3) & 1)))
         image[mo:mo + size] = raw
+    def checked(offset, size, label):
+        if offset < 0 or size < 0 or offset > len(image) or size > len(image) - offset:
+            raise ValueError(label + ' outside image bounds')
+        return image[offset:offset + size]
+
+    checked(0, 8, 'NSO entry')
     mod = struct.unpack_from('<I', image, 4)[0]
-    if image[mod:mod + 4] != b'MOD0':
+    header = checked(mod, 8, 'MOD0')
+    if header[:4] != b'MOD0':
         raise ValueError('NSO MOD0 not found')
-    dyn = mod + struct.unpack_from('<i', image, mod + 4)[0]
+    dyn = mod + struct.unpack_from('<i', header, 4)[0]
+    checked(dyn, 16, 'dynamic table')
     tags = {}
     for off in range(dyn, len(image) - 15, 16):
         key, value = struct.unpack_from('<QQ', image, off)
@@ -54,10 +62,13 @@ def nso_info(data):
     if 6 in tags and 5 in tags:
         if tags.get(11, 24) != 24:
             raise ValueError('not ELF64 dynamic symbols')
-        count = struct.unpack_from('<I', image, tags[4] + 4)[0] if 4 in tags else (tags[5] - tags[6]) // 24
+        count = struct.unpack_from('<I', checked(tags[4], 8, 'symbol hash'), 4)[0] if 4 in tags else (tags[5] - tags[6]) // 24
         if not 0 <= count <= 1000000:
             raise ValueError('invalid symbol count')
-        strings = image[tags[5]:tags[5] + tags[10]]
+        if 10 not in tags:
+            raise ValueError('missing string table size')
+        checked(tags[6], count * 24, 'symbol table')
+        strings = checked(tags[5], tags[10], 'string table')
         for i in range(count):
             name, info, other, shndx, value, size = struct.unpack_from('<IBBHQQ', image, tags[6] + i * 24)
             stop = strings.find(0, name)
@@ -65,10 +76,15 @@ def nso_info(data):
                 raise ValueError('invalid dynamic symbol name')
             text = strings[name:stop].decode('utf-8')
             if text:
-                symbols.append(dict(name=text, defined=bool(shndx), value=value, size=size, type=info & 15))
+                symbols.append(dict(name=text, defined=bool(shndx), value=value, size=size, type=info & 15,
+                                    binding=info >> 4, visibility=other & 3, section=shndx))
     relocations = collections.Counter()
     for offset_tag, size_tag in [(7, 8), (23, 2)]:
         if offset_tag in tags:
+            size = tags.get(size_tag, 0)
+            if size % 24:
+                raise ValueError('invalid relocation table size')
+            checked(tags[offset_tag], size, 'relocation table')
             for off in range(tags[offset_tag], tags[offset_tag] + tags.get(size_tag, 0), 24):
                 _, info, _ = struct.unpack_from('<QQq', image, off)
                 relocations[str(info & 0xffffffff)] += 1

@@ -26,7 +26,14 @@ int main(int argc,char **argv) {
         assert(captured->stage==1 && captured->code.length==0xd0 && captured->constants.length==16 && strlen(captured->key)==64);
         assert(!memcmp(captured->code.bytes,code+0x30,0xd0));memset(code,0,0x200);
         assert(((const uint8_t *)captured->code.bytes)[4]==0x69);
-        program_finalize(&program);assert(!program);
+        HyCommands commands;assert(command_initialize(&commands,&d));
+        command_memory(&commands,&pool,0x2000,0x1000);hy_commands_begin(&commands);
+        void (*bind_program)(HyCommands *,void *const *,uint32_t)=lookup("nvnCommandBufferBindProgram");
+        bind_program(&commands,&program,3);hy_commands_end(&commands);
+        __weak NSArray *recorded=snapshot;program_finalize(&program);assert(!program);snapshot=nil;
+        assert(recorded && ((HyShader *)recorded[0])->code.length==0xd0);
+        command_initialize(&commands,&d);command_memory(&commands,&pool,0x2000,0x1000);
+        hy_commands_begin(&commands);hy_commands_end(&commands);assert(!recorded);
         pool_finalize(&pool);free(memory);
         assert(((const uint8_t *)captured->constants.bytes)[0]==0x69);
         puts("PASS: shader snapshots survive source mutation, program finalization and pool release");
