@@ -29,5 +29,13 @@ int main(void) {
     assert(second[39] == 0x5a && ((HyRecord *)(second + 40))->op == HY_END);
     assert(c.used == 48 && c.size == 128);
     hy_commands_begin(&c); assert(hy_commands_end(&c) == (uintptr_t)(second + 48));
+    _Alignas(8) uint8_t depth_bytes[128]; HyCommands depth;
+    hy_commands_init(&depth,(void *)1);hy_commands_memory(&depth,depth_bytes,sizeof depth_bytes);
+    hy_commands_begin(&depth);hy_commands_depth_range(&depth,0.75f,0.25f);hy_commands_depth_clamp(&depth,1);hy_commands_viewport(&depth,3,4,1920,1080);hy_commands_scissor(&depth,11,12,100,200);hy_commands_end(&depth);
+    assert(((HyRecord *)(depth_bytes+8))->op==HY_DEPTH_RANGE);
+    assert(((HyRecord *)(depth_bytes+24))->op==HY_DEPTH_CLAMP && *(uint32_t *)(depth_bytes+32)==1);
+    int32_t rect[4];memcpy(rect,depth_bytes+48,sizeof rect);assert(!memcmp(rect,(int32_t[]){3,4,1920,1080},sizeof rect));
+    memcpy(rect,depth_bytes+72,sizeof rect);assert(!memcmp(rect,(int32_t[]){11,12,100,200},sizeof rect));
+    float range[2];memcpy(range,depth_bytes+16,sizeof range);assert(range[0]==0.75f && range[1]==0.25f);
     puts("PASS: command payload snapshot, segment callback/jump, persistent handles and bounds");
 }

@@ -22,6 +22,7 @@ static void performance(unsigned mode, unsigned configuration) { (void)mode; (vo
 static int pop_notification(unsigned *message) { (void)message; return 0; }
 static void fs_allocator(void *allocate, void *release) { (void)allocate; (void)release; /* Host-owned handles use host allocation. */ }
 static void ro_init(void) { fputs("host module registry: main, subsdk0, sdk\n", stderr); }
+static unsigned network_init(void) { fputs("host network: offline\n",stderr); return 0; }
 static unsigned time_init(void) { tzset(); return 0; }
 static void flush_data(const void *data, size_t size) { sys_dcache_flush((void *)data, size); }
 static unsigned current_time(int64_t *out) { *out = time(NULL); return 0; }
@@ -40,6 +41,8 @@ void *hy_service(const char *name) {
     if (graphics) return graphics;
     void *audio = hy_audio_service(name);
     if (audio) return audio;
+    void *account=hy_account_service(name);
+    if (account) return account;
     void *input = hy_input_service(name);
     if (input) return input;
     void *fs = hy_filesystem_service(name);
@@ -60,6 +63,7 @@ void *hy_service(const char *name) {
         {"_ZN2nn2oe25TryPopNotificationMessageEPj", (void *)pop_notification},
         {"_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", (void *)fs_allocator},
         {"_ZN2nn2ro10InitializeEv", (void *)ro_init},
+        {"_ZN2nn4nifm10InitializeEv", (void *)network_init},
         {"_ZN2nn4time10InitializeEv", (void *)time_init},
         {"_ZN2nn2os14FlushDataCacheEPKvm", (void *)flush_data},
         {"_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", (void *)current_time},

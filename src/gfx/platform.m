@@ -9,6 +9,9 @@
 #include "vertex.h"
 #include "commands.h"
 #include "sampler.h"
+#include "shader.h"
+#include "bc7.h"
+#include <CommonCrypto/CommonDigest.h>
 #include "nvn_deswizzle.h"
 extern const char *const hy_nvn_names[];
 extern void *const hy_nvn_gates[];
@@ -22,11 +25,15 @@ static uint64_t display_token;
 static void *vsync_event, *resolution_event;
 static uint64_t next_tick;
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t display_changed = PTHREAD_COND_INITIALIZER;
 typedef struct { void *device, *storage; size_t size; uint32_t flags; } PoolBuilder;
-typedef struct {
+typedef struct Pool {
     void *storage, *buffer; size_t size, offset; uint32_t flags;
     struct TextureBacking *textures; unsigned buffers; pthread_mutex_t lock;
+    struct Pool *next;
 } Pool;
+static Pool *pools;
+static pthread_mutex_t pools_lock=PTHREAD_MUTEX_INITIALIZER;
 // Descriptors are host references, never Maxwell descriptor words.
 typedef struct { void *resource; void *view; } Descriptor;
 typedef struct { Pool *pool; size_t offset; int count; } DescriptorPool;
@@ -41,7 +48,7 @@ typedef struct {
     void *device;
     int flags, target, width, height, depth, levels, format, samples;
     Pool **pool; ptrdiff_t offset, stride;
-    uint8_t layout[8]; int has_layout;
+    uint16_t layout; int has_layout;
 } TextureBuilder;
 _Static_assert(sizeof(TextureBuilder) <= 128, "NVN texture builder size");
 typedef struct TextureBacking {
@@ -125,6 +132,9 @@ static void integer(const void *object, unsigned query, int *out) {
     if (query == 0x13 || query == 0x14) { *out = 8; return; } // Host command words/pointers.
     if (query == 0x15) { *out = 32; return; }
     if (query == 0x16) { *out = 16; return; }
+    // Guest spill storage is an allocator reservation; Metal manages shader spills.
+    if (query == 0x19 || query == 0x1a) { *out=256; return; }
+    if (query == 0x17 || query == 0x18) { *out=1; return; }
     // Only API version queries are delegated to the shipped SDK. Hardware limits
     // must be supplied by an implemented Metal path, not copied from another game.
     if (query > 1) hy_fail("NVN device capability not implemented: %#x", query);
@@ -155,6 +165,7 @@ static uint32_t pool_initialize(Pool **object, const PoolBuilder *b) {
         p->storage = b->storage; p->size = b->size; p->flags = b->flags; p->offset = base - low;
         p->buffer = (__bridge_retained void *)buffer;
         pthread_mutex_init(&p->lock, NULL);
+        pthread_mutex_lock(&pools_lock); p->next=pools; pools=p; pthread_mutex_unlock(&pools_lock);
         *object = p;
         fprintf(stderr, "NVN Metal memory pool: %zu bytes flags=%#x\n", p->size, p->flags);
     }
@@ -164,6 +175,11 @@ static void pool_finalize(Pool **object) {
     Pool *p = *object;
     if (!p) hy_fail("invalid NVN memory pool finalize");
     if (p->textures || p->buffers) hy_fail("memory pool finalized with live resources");
+    pthread_mutex_lock(&pools_lock);
+    Pool **slot=&pools; while (*slot && *slot!=p) slot=&(*slot)->next;
+    if (!*slot) hy_fail("unregistered memory pool finalize");
+    *slot=p->next;
+    pthread_mutex_unlock(&pools_lock);
     @autoreleasepool {
         id<MTLCommandBuffer> fence = [queue commandBuffer]; [fence commit]; [fence waitUntilCompleted];
         id buffer = (__bridge_transfer id)p->buffer; (void)buffer;
@@ -178,6 +194,72 @@ static void pool_flush(Pool *const *object, ptrdiff_t offset, size_t size) {
     Pool *p = *object;
     if (offset < 0 || (size_t)offset > p->size || size > p->size - (size_t)offset) hy_fail("NVN pool flush out of bounds");
     sys_dcache_flush((uint8_t *)p->storage + offset, size);
+}
+static NSData *pool_copy(uint64_t address,size_t size) {
+    NSData *result=nil;
+    pthread_mutex_lock(&pools_lock);
+    for (Pool *p=pools;p;p=p->next) {
+        uint64_t base=(uintptr_t)p->storage;
+        if (address>=base && address-base<=p->size && size<=p->size-(address-base)) {
+            result=[NSData dataWithBytes:(const void *)(uintptr_t)address length:size]; break;
+        }
+    }
+    pthread_mutex_unlock(&pools_lock);
+    if (!result) hy_fail("GPU address outside live memory pools");
+    return result;
+}
+typedef struct { uint64_t address; const void *control; } HyShaderData;
+@interface HyShader : NSObject {
+@public
+    NSData *control, *code, *constants;
+    uint32_t stage;
+    char key[65];
+}
+@end
+@implementation HyShader
+@end
+static uint32_t program_initialize(void **object,const void *d) {
+    if (!device || !d) hy_fail("program device missing");
+    *object=(__bridge_retained void *)[NSArray array]; return 1;
+}
+static void program_finalize(void **object) {
+    id old=(__bridge_transfer id)*object; (void)old; *object=NULL;
+}
+static void program_label(void *const *object,const char *label) {
+    if (!*object) hy_fail("label on finalized program");
+    fprintf(stderr,"NVN program label: %.120s\n",label ? label : "");
+}
+static uint32_t program_shaders(void **object,int count,const HyShaderData *inputs) {
+    if (!*object || count<1 || count>6 || !inputs) hy_fail("invalid program shader list");
+    NSMutableArray *captured=[NSMutableArray arrayWithCapacity:count]; unsigned stages=0;
+    for (int i=0;i<count;i++) {
+        HyShader *shader=[HyShader new]; uintptr_t address=(uintptr_t)inputs[i].control;
+        for (size_t j=0;j<hy_module_count;j++) {
+            HyModule *m=&hy_modules[j]; uintptr_t base=(uintptr_t)m->base;
+            if (address>=base && address-base<=m->size && 0x880<=m->size-(address-base)) {
+                shader->control=[NSData dataWithBytes:inputs[i].control length:0x880]; break;
+            }
+        }
+        if (!shader->control) shader->control=pool_copy(address,0x880);
+        HyShaderLayout layout;
+        if (!hy_shader_layout(shader->control.bytes,shader->control.length,&layout)) hy_fail("unsupported shader control layout");
+        if (stages&(1u<<layout.stage)) hy_fail("duplicate program shader stage");
+        stages|=1u<<layout.stage;
+        NSData *blob=pool_copy(inputs[i].address,layout.extent);
+        uint32_t sph; memcpy(&sph,(const uint8_t *)blob.bytes+layout.prefix,4);
+        if (((sph>>10)&15)!=layout.stage) hy_fail("shader control and SPH stages disagree");
+        shader->stage=layout.stage;
+        shader->code=[blob subdataWithRange:NSMakeRange(layout.prefix,layout.code_size)];
+        shader->constants=[blob subdataWithRange:NSMakeRange(layout.constant_offset,layout.constant_size)];
+        uint8_t digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(shader->control.bytes,(CC_LONG)shader->control.length,digest);
+        for (unsigned k=0;k<sizeof digest;k++) snprintf(shader->key+2*k,3,"%02x",digest[k]);
+        fprintf(stderr,"NVN shader: %s SPH-stage=%u\n",shader->key,shader->stage);
+        [captured addObject:shader];
+    }
+    NSArray *snapshot=[captured copy];
+    program_finalize(object); *object=(__bridge_retained void *)snapshot;
+    fprintf(stderr,"NVN program captured: %d immutable shader stages\n",count);
+    return 1;
 }
 typedef struct { void *device; Pool **pool; ptrdiff_t offset; size_t size; } BufferBuilder;
 typedef struct { Pool **handle; Pool *pool; size_t offset, size; } Buffer;
@@ -355,12 +437,15 @@ static void texture_depth_mode(TextureBuilder *b, int mode) {
     if (mode!=0) hy_fail("texture-builder stencil sampling is not implemented");
 }
 static void texture_size2d(TextureBuilder *b, int w, int h) { b->width = w; b->height = h; b->depth = 1; }
+static void texture_size3d(TextureBuilder *b,int w,int h,int depth) { b->width=w; b->height=h; b->depth=depth; }
 static void texture_storage(TextureBuilder *b, Pool **p, ptrdiff_t offset) { b->pool = p; b->offset = offset; }
 static void texture_stride(TextureBuilder *b, ptrdiff_t stride) { b->stride = stride; }
 static void texture_layout(TextureBuilder *b, const void *layout) {
     b->has_layout = layout != NULL;
-    if (layout) memcpy(b->layout, layout, 8); else memset(b->layout, 0, 8);
+    b->layout=0;
+    if (layout) { memcpy(&b->layout,layout,2); b->layout&=0xfff; }
 }
+static uint32_t texture_get_layout(const TextureBuilder *b,uint32_t *out) { *out=b->has_layout ? b->layout : 0;return b->has_layout; }
 static int texture_get_flags(const TextureBuilder *b) { return b->flags; }
 static int texture_get_target(const TextureBuilder *b) { return b->target; }
 static int texture_get_width(const TextureBuilder *b) { return b->width; }
@@ -370,14 +455,20 @@ static int texture_get_levels(const TextureBuilder *b) { return b->levels; }
 static int texture_get_format(const TextureBuilder *b) { return b->format; }
 static int texture_get_samples(const TextureBuilder *b) { return b->samples; }
 static nvn_texdesc texture_description(const TextureBuilder *b) {
+    int bytes_per_block=nvn_fmt_bpb(b->format,NULL,NULL);
     if (b->target != 1 || b->width < 1 || b->width > 16384 || b->height < 1 || b->height > 16384 ||
         b->depth != 1 || b->levels < 1 || b->levels > 15 || b->samples > 1 || b->samples < 0 ||
-        (b->flags & ~0x29) || ((b->flags&0x20) && (b->levels!=1 || b->has_layout || (nvn_fmt_bpb(b->format,NULL,NULL)!=4 && b->format!=0x36))) || (b->has_layout && b->layout[0] > 5) || !nvn_fmt_bpb(b->format, NULL, NULL))
-        hy_fail("unsupported texture: %dx%dx%d target=%d format=%#x flags=%#x levels=%d samples=%d",
-            b->width, b->height, b->depth, b->target, b->format, b->flags, b->levels, b->samples);
+        (b->flags & ~0x29) || ((b->flags&0x20) && (b->levels!=1 ||
+        (bytes_per_block!=1 && bytes_per_block!=2 && bytes_per_block!=4 && bytes_per_block!=8 && bytes_per_block!=16))) ||
+        (b->has_layout && ((b->layout&15)>5 || (b->layout&0xf0) || (b->layout>>8)>5 ||
+        ((b->layout>>8) && b->levels>1))) || !bytes_per_block)
+        hy_fail("unsupported texture: %dx%dx%d target=%d format=%#x flags=%#x levels=%d samples=%d packaged=%d layout=%#x",
+            b->width,b->height,b->depth,b->target,b->format,b->flags,b->levels,b->samples,b->has_layout,
+            b->layout);
     return (nvn_texdesc){.target=b->target,.format=b->format,.flags=b->flags,.samples=b->samples,
         .width=b->width,.height=b->height,.depth=b->depth,.levels=b->levels,
-        .pkg_block_h=b->has_layout ? b->layout[0]+1 : 0};
+        .pkg_block_h=b->has_layout ? (b->layout&15)+1 : 0,
+        .pkg_block_w=b->has_layout ? (b->layout>>8)+1 : 0};
 }
 static size_t texture_size(const TextureBuilder *b) {
     nvn_texdesc d = texture_description(b); nvn_texlayout layout; nvn_tex_layout(&d, &layout); return layout.size;
@@ -385,10 +476,26 @@ static size_t texture_size(const TextureBuilder *b) {
 static size_t texture_alignment(const TextureBuilder *b) {
     nvn_texdesc d=texture_description(b); nvn_texlayout layout; nvn_tex_layout(&d,&layout); return layout.align;
 }
+static void texture_sparse_tiles(const TextureBuilder *b,uint32_t *out) {
+    memset(out,0,16);
+    nvn_texdesc d=texture_description(b);
+    if (!(b->flags&0x20)) return;
+    d.pkg_block_h=d.pkg_block_w=0; // The SDK's sparse query ignores packaged overrides.
+    nvn_texlayout layout;nvn_tex_layout(&d,&layout);
+    if (layout.tileW) {
+        int block_width,block_height;nvn_fmt_bpb(b->format,&block_width,&block_height);
+        out[0]=1;out[1]=(64u<<layout.tileW)/layout.bpb*block_width;
+        out[2]=(8u<<layout.tileH)*block_height;out[3]=1;
+    }
+}
 static MTLPixelFormat texture_metal_format(int format) {
     switch (format) {
+    case 0x1: return MTLPixelFormatR8Unorm;
     case 0x25: return MTLPixelFormatRGBA8Unorm;
     case 0x3d: return MTLPixelFormatRGB10A2Unorm;
+    case 0x3f: return MTLPixelFormatRG11B10Float;
+    case 0x4d: return MTLPixelFormatRGBA8Unorm; // BC7 is decoded for portable iPhone support.
+    case 0x4e: return MTLPixelFormatRGBA8Unorm_sRGB;
     case 0x38: return MTLPixelFormatRGBA8Unorm_sRGB;
     case 0x34: return MTLPixelFormatDepth32Float;
     case 0x36: return MTLPixelFormatDepth32Float_Stencil8;
@@ -419,6 +526,8 @@ static uint32_t texture_initialize(Texture *t, const TextureBuilder *b) {
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
         width:b->width height:b->height mipmapped:b->levels > 1];
     desc.mipmapLevelCount = b->levels; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+    int bc7=b->format==0x4d || b->format==0x4e;
+    if (bc7) desc.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
     int depth = b->format == 0x34 || b->format == 0x36;
     desc.storageMode = depth ? MTLStorageModePrivate : MTLStorageModeShared;
     id<MTLTexture> image = [device newTextureWithDescriptor:desc];
@@ -427,9 +536,18 @@ static uint32_t texture_initialize(Texture *t, const TextureBuilder *b) {
         void *storage = (uint8_t *)(*b->pool)->storage + b->offset;
         for (int level = 0; level < b->levels; level++) {
             size_t w = b->width >> level, h = b->height >> level; if (!w) w=1; if (!h) h=1;
-            void *linear = malloc(w * h * 4); if (!linear) hy_fail("texture staging allocation");
-            if (nvn_deswizzle(&d, level, 0, storage, linear, w * 4)) hy_fail("texture deswizzle");
-            [image replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:level withBytes:linear bytesPerRow:w*4];
+            int bw,bh;size_t block_bytes=nvn_fmt_bpb(b->format,&bw,&bh);
+            size_t pitch=(w+bw-1)/bw*block_bytes,linear_size=pitch*((h+bh-1)/bh);
+            void *linear = malloc(linear_size); if (!linear) hy_fail("texture staging allocation");
+            if (nvn_deswizzle(&d, level, 0, storage, linear, pitch)) hy_fail("texture deswizzle");
+            if (bc7) {
+                void *pixels=malloc(w*h*4);if (!pixels) hy_fail("BC7 staging allocation");
+                if (hy_bc7_decode(linear,linear_size,(uint32_t)w,(uint32_t)h,pixels,w*4,w*h*4)) hy_fail("BC7 decode bounds");
+                [image replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:level withBytes:pixels bytesPerRow:w*4];
+                free(pixels);
+            } else {
+                [image replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:level withBytes:linear bytesPerRow:pitch];
+            }
             free(linear);
         }
     }
@@ -575,6 +693,8 @@ static void window_crop(Window *w, int x, int y, int width, int height) {
         width>texture->builder.width-x || height>texture->builder.height-y) hy_fail("window crop out of range");
     w->crop[0]=x; w->crop[1]=y; w->crop[2]=width; w->crop[3]=height;
 }
+static void window_present_interval(Window *w, int interval) { window_interval(&w->builder,interval); }
+static int window_get_interval(const Window *w) { return w->builder.interval; }
 static void window_get_crop(const Window *w, int *rectangle) { memcpy(rectangle,w->crop,sizeof w->crop); }
 static void display_initialize(void) {
     if (!device) hy_fail("display initialized before Metal");
@@ -618,12 +738,15 @@ int hy_graphics_event(void *event, int operation) {
     int vsync = event == vsync_event;
     if (operation == 3) {
         if (vsync) vsync_event = NULL; else resolution_event = NULL;
+        pthread_cond_broadcast(&display_changed);
         pthread_mutex_unlock(&display_lock); return 1;
     }
     if (!vsync) {
-        pthread_mutex_unlock(&display_lock);
-        if (!operation) hy_fail("cannot wait indefinitely for fixed display resolution change");
-        return 0;
+        // Fixed headless resolution never signals a change. Keep a real wait
+        // pending until event destruction rather than reporting a false change.
+        if (!operation) while (resolution_event==event)
+            pthread_cond_wait(&display_changed,&display_lock);
+        pthread_mutex_unlock(&display_lock); return 0;
     }
     if (operation == 2) { next_tick = monotonic_ns() + 16666667; pthread_mutex_unlock(&display_lock); return 1; }
     for (;;) {
@@ -654,6 +777,9 @@ static void display_clear(void *event) {
 static void *lookup(const char *name) {
     static const struct { const char *name; void *fn; } functions[] = {
         {"nvnDeviceGetProcAddress", get_proc}, {"nvnDeviceGetInteger", integer},
+        {"nvnProgramInitialize", program_initialize}, {"nvnProgramFinalize", program_finalize},
+        {"nvnProgramSetShaders", program_shaders},
+        {"nvnProgramSetDebugLabel", program_label},
         {"nvnDeviceBuilderSetDefaults", builder_defaults}, {"nvnDeviceBuilderSetFlags", builder_flags},
         {"nvnDeviceInitialize", initialize_device},
         {"nvnDeviceSetDepthMode", set_depth}, {"nvnDeviceSetWindowOriginMode", set_origin},
@@ -689,6 +815,10 @@ static void *lookup(const char *name) {
         {"nvnQueueFinish", queue_finish}, {"nvnQueueFinalize", queue_finalize},
         {"nvnQueueFlush", queue_finish}, // Synchronous flush until asynchronous submission is implemented.
         {"nvnCommandBufferReportCounter", command_counter},
+        {"nvnCommandBufferSetDepthRange", hy_commands_depth_range},
+        {"nvnCommandBufferSetDepthClamp", hy_commands_depth_clamp},
+        {"nvnCommandBufferSetViewport", hy_commands_viewport},
+        {"nvnCommandBufferSetScissor", hy_commands_scissor},
         {"nvnCommandBufferSetTexturePool", command_texture_pool}, {"nvnCommandBufferSetSamplerPool", command_sampler_pool},
         {"nvnCommandBufferBindMultisampleState", command_multisample}, {"nvnCommandBufferBindColorState", command_color},
         {"nvnCommandBufferBindBlendState", command_blend}, {"nvnCommandBufferBindChannelMaskState", command_channels},
@@ -701,12 +831,15 @@ static void *lookup(const char *name) {
         {"nvnTextureBuilderSetFlags", texture_flags}, {"nvnTextureBuilderSetTarget", texture_target},
         {"nvnTextureBuilderSetWidth", texture_width}, {"nvnTextureBuilderSetHeight", texture_height},
         {"nvnTextureBuilderSetDepth", texture_depth}, {"nvnTextureBuilderSetSize2D", texture_size2d},
+        {"nvnTextureBuilderSetSize3D", texture_size3d},
         {"nvnTextureBuilderSetLevels", texture_levels}, {"nvnTextureBuilderSetFormat", texture_format},
         {"nvnTextureBuilderSetDepthStencilMode", texture_depth_mode},
         {"nvnTextureBuilderSetSamples", texture_samples}, {"nvnTextureBuilderSetStorage", texture_storage},
         {"nvnTextureBuilderSetStride", texture_stride}, {"nvnTextureBuilderSetPackagedTextureLayout", texture_layout},
+        {"nvnTextureBuilderGetPackagedTextureLayout", texture_get_layout},
         {"nvnTextureBuilderGetStorageSize", texture_size},
         {"nvnTextureBuilderGetStorageAlignment", texture_alignment},
+        {"nvnTextureBuilderGetSparseTileLayout", texture_sparse_tiles},
         {"nvnTextureBuilderGetFlags", texture_get_flags}, {"nvnTextureBuilderGetTarget", texture_get_target},
         {"nvnTextureBuilderGetWidth", texture_get_width}, {"nvnTextureBuilderGetHeight", texture_get_height},
         {"nvnTextureBuilderGetDepth", texture_get_depth}, {"nvnTextureBuilderGetLevels", texture_get_levels},
@@ -716,6 +849,7 @@ static void *lookup(const char *name) {
         {"nvnTextureViewSetDefaults", view_defaults}, {"nvnTextureViewSetLevels", view_levels},
         {"nvnTextureViewSetLayers", view_layers}, {"nvnTextureViewSetFormat", view_format}, {"nvnTextureViewSetTarget", view_target},
         {"nvnTextureViewSetDepthStencilMode", view_depth_mode}, {"nvnTextureViewSetSwizzle", view_swizzle},
+        {"nvnWindowSetPresentInterval", window_present_interval}, {"nvnWindowGetPresentInterval", window_get_interval},
         {"nvnWindowSetCrop", window_crop}, {"nvnWindowGetCrop", window_get_crop},
         {"nvnWindowBuilderSetDefaults", window_defaults}, {"nvnWindowBuilderSetDevice", window_device},
         {"nvnWindowBuilderSetNativeWindow", window_native}, {"nvnWindowBuilderSetTextures", window_textures},

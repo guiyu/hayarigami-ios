@@ -23,5 +23,12 @@ int main(int argc, char **argv) {
     assert(open_file(&h, "rom:/../outside.bin", 1) != 0);
     assert(open_file(&h, "rom:/escape", 1) != 0);
     assert(open_file(&h, "rom:/data.bin", 2) != 0);
-    puts("PASS: RomFS reads, EOF, stale handles and path containment");
+    uint64_t simultaneous[96];
+    for(size_t i=0;i<96;i++) assert(!open_file(&simultaneous[i],"rom:/data.bin",1));
+    for(size_t i=0;i<96;i++) {
+        assert(!read_file(&got,simultaneous[i],0,bytes,4) && got==4);
+        close_file(simultaneous[i]);
+    }
+    assert(read_file(&got,simultaneous[0],0,bytes,4)!=0);
+    puts("PASS: RomFS reads, EOF, stale handles, containment and 96 simultaneous resource handles");
 }

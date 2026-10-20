@@ -1,6 +1,7 @@
 #include "runtime.h"
 #include <string.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 typedef struct { int64_t sample; uint64_t buttons; int32_t lx, ly, rx, ry; uint32_t attributes, padding; } PadState;
 _Static_assert(sizeof(PadState) == 40, "Horizon pad ABI");
@@ -14,6 +15,15 @@ void hy_input_set(uint64_t value, int attached) {
     atomic_store(&connected, attached);
 }
 static void init(void) { styles = 0; allowed_ids = 0; }
+static void touch_init(void) { fputs("host touchscreen input selected\n",stderr); }
+// This title requests TouchScreenState<16>: sample/count/padding then 16x40 bytes.
+// The headless host has no touch source; UIKit injection is a separate milestone.
+typedef struct { int64_t sample; uint32_t count, padding; uint8_t touches[16][40]; } TouchState;
+_Static_assert(sizeof(TouchState)==656,"title touchscreen ABI");
+static _Atomic int64_t touch_sample;
+static void read_touch(TouchState *out) {
+    memset(out,0,sizeof *out); out->sample=atomic_fetch_add(&touch_sample,1)+1;
+}
 static void set_styles(uint32_t value) { styles = value; }
 static void set_ids(const uint32_t *ids, size_t count) {
     if (count > 10) hy_fail("invalid supported pad count");
@@ -38,6 +48,8 @@ void *hy_input_service(const char *name) {
 #define ENTRY(n, f) {n, (void *)f}
     static const struct { const char *name; void *fn; } table[] = {
         ENTRY("_ZN2nn3hid14InitializeNpadEv", init),
+        ENTRY("_ZN2nn3hid21InitializeTouchScreenEv", touch_init),
+        ENTRY("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", read_touch),
         ENTRY("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", set_ids),
         ENTRY("_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", set_styles),
         ENTRY("_ZN2nn3hid15GetNpadStyleSetERKj", get_style),

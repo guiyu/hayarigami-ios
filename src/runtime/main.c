@@ -29,6 +29,7 @@ int main(int argc, char **argv) {
         hy_symbol("_ZN2nn4init5StartEmmPFvvES2_S2_");
     if (!start) hy_fail("SDK Start export not found");
     fputs("entering real SDK Start\n", stderr);
+    alarm(120); // Resource initialization can outlast the short loader/fixture guard.
     start(0x100, 0, callback_a, callback_b, callback_c);
     hy_fail("SDK Start unexpectedly returned");
 }

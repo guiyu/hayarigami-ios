@@ -5,7 +5,7 @@
 typedef struct { uint32_t op, size; } HyRecord;
 enum { HY_BEGIN = 1, HY_END, HY_JUMP, HY_TEXTURE_POOL, HY_SAMPLER_POOL,
     HY_MULTISAMPLE_STATE, HY_COLOR_STATE, HY_BLEND_STATE, HY_CHANNEL_MASK_STATE,
-    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER };
+    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER, HY_DEPTH_RANGE, HY_DEPTH_CLAMP, HY_VIEWPORT, HY_SCISSOR };
 typedef struct { uint64_t address; int type; } HyCounterRecord;
 typedef struct HyCommands HyCommands;
 typedef void (*HyMemoryCallback)(HyCommands *, int, size_t, void *);
@@ -50,6 +50,18 @@ static inline void *hy_commands_record(HyCommands *c, uint32_t op, size_t bytes)
     HyRecord header = {op, (uint32_t)size}; memcpy(p, &header, 8);
     memset(p + 8, 0, size - 8); c->used += size;
     return p + 8;
+}
+static inline void hy_commands_depth_range(HyCommands *c, float near, float far) {
+    float range[]={near,far}; memcpy(hy_commands_record(c,HY_DEPTH_RANGE,sizeof range),range,sizeof range);
+}
+static inline void hy_commands_depth_clamp(HyCommands *c, uint32_t enabled) {
+    enabled=!!(enabled&255); memcpy(hy_commands_record(c,HY_DEPTH_CLAMP,sizeof enabled),&enabled,sizeof enabled);
+}
+static inline void hy_commands_viewport(HyCommands *c, int32_t x, int32_t y, int32_t width, int32_t height) {
+    int32_t rect[]={x,y,width,height}; memcpy(hy_commands_record(c,HY_VIEWPORT,sizeof rect),rect,sizeof rect);
+}
+static inline void hy_commands_scissor(HyCommands *c, int32_t x, int32_t y, int32_t width, int32_t height) {
+    int32_t rect[]={x,y,width,height}; memcpy(hy_commands_record(c,HY_SCISSOR,sizeof rect),rect,sizeof rect);
 }
 static inline void hy_commands_begin(HyCommands *c) {
     if (c->recording) hy_fail("nested NVN command recording");

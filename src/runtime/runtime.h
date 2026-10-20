@@ -26,6 +26,8 @@ void *hy_graphics_service(const char *name);
 // -1 means foreign event; otherwise handled. Operations: wait, poll, clear, destroy.
 int hy_graphics_event(void *event, int operation);
 void *hy_input_service(const char *name);
+void *hy_account_service(const char *name);
+int hy_account_user_valid(const void *uid);
 void hy_input_set(uint64_t buttons, int connected);
 void hy_filesystem_init(const char *romfs);
 void *hy_filesystem_service(const char *name);

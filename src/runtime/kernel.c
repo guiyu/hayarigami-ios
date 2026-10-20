@@ -16,6 +16,7 @@ static size_t heap_size;
 static struct { uintptr_t base, source; size_t size; unsigned state; } physical[64];
 static size_t physical_count;
 static pthread_mutex_t memory_lock = PTHREAD_MUTEX_INITIALIZER;
+static int trace_syscalls;
 // Virtual reservation, not resident allocation. Standard 4 GiB Switch application pool.
 #define RESERVE_SIZE 0x140000000ull
 #define HEAP_OFFSET 0x40000000ull
@@ -223,6 +224,17 @@ static void location(uint64_t address) {
     }
     fprintf(stderr, "host/unknown 0x%llx", address);
 }
+static void callers(const uint64_t *r) {
+    uintptr_t frame = r[29];
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    uintptr_t bottom = top - pthread_get_stacksize_np(pthread_self());
+    for (int depth = 0; depth < 20 && frame >= bottom && frame <= top - 16 && !(frame & 15); depth++) {
+        uint64_t *fp = (uint64_t *)frame;
+        fputs("  caller ", stderr); location(fp[1]); fputc('\n', stderr);
+        if (fp[0] <= frame) break;
+        frame = fp[0];
+    }
+}
 static void crash(int sig, siginfo_t *info, void *context) {
     ucontext_t *u = context;
     fprintf(stderr, "SIGNAL %d address=%p pc=", sig, info->si_addr);
@@ -233,6 +245,7 @@ static void crash(int sig, siginfo_t *info, void *context) {
     _Exit(128 + sig);
 }
 void hy_install_signals(void) {
+    const char *trace=getenv("HY_TRACE_SVC"); trace_syscalls=trace && strcmp(trace,"0");
     struct sigaction a = {0}; a.sa_sigaction = crash; a.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &a, NULL); sigaction(SIGBUS, &a, NULL);
     sigaction(SIGILL, &a, NULL); sigaction(SIGTRAP, &a, NULL);
@@ -262,19 +275,21 @@ void hy_gate_dispatch(uint64_t address, uint64_t *r) {
             if (g->arg < 31) r[g->arg] = system_tick();
             return;
         }
-        fprintf(stderr, "SVC 0x%x at ", g->arg); location(g->original);
-        fprintf(stderr, " x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n", r[0], r[1], r[2], r[3]);
-        if (syscall_impl(g->arg, r)) return;
-        if (g->arg == 0x1f) fprintf(stderr, "named port: %.12s\n", (char *)(uintptr_t)r[1]);
-        uintptr_t frame = r[29];
-        uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
-        uintptr_t bottom = top - pthread_get_stacksize_np(pthread_self());
-        for (int depth = 0; depth < 20 && frame >= bottom && frame <= top - 16 && !(frame & 15); depth++) {
-            uint64_t *fp = (uint64_t *)frame;
-            fputs("  caller ", stderr); location(fp[1]); fputc('\n', stderr);
-            if (fp[0] <= frame) break;
-            frame = fp[0];
+        if (trace_syscalls) {
+            fprintf(stderr, "SVC 0x%x at ", g->arg); location(g->original);
+            fprintf(stderr, " x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n", r[0], r[1], r[2], r[3]);
         }
+        if (g->arg==0x26 && !(r[0]&0x80000000)) {
+            fputs("Guest fatal break at ",stderr); location(g->original); fputc('\n',stderr);
+            callers(r);
+        }
+        if (syscall_impl(g->arg, r)) return;
+        if (!trace_syscalls) {
+            fprintf(stderr, "SVC 0x%x at ", g->arg); location(g->original);
+            fprintf(stderr, " x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n", r[0], r[1], r[2], r[3]);
+        }
+        if (g->arg == 0x1f) fprintf(stderr, "named port: %.12s\n", (char *)(uintptr_t)r[1]);
+        callers(r);
         hy_fail("unimplemented SVC 0x%x", g->arg);
     }
     hy_fail("unregistered gate");

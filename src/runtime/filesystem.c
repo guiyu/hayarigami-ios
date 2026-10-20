@@ -10,7 +10,8 @@
 
 static int root_fd = -1;
 static char mount_name[16];
-static struct { uint64_t handle; int fd; } files[64];
+enum { FILE_LIMIT=128 }; // The title retains at least 66 archive handles during startup.
+static struct { uint64_t handle; int fd; } files[FILE_LIMIT];
 static uint64_t next_handle = 1;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 void hy_filesystem_init(const char *root) {
@@ -51,15 +52,15 @@ static unsigned open_file(uint64_t *out, const char *path, int mode) {
     struct stat st;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); return 0xfa01; }
     pthread_mutex_lock(&lock);
-    size_t i; for (i = 0; i < 64 && files[i].handle; i++) {}
-    if (i == 64) { pthread_mutex_unlock(&lock); close(fd); return 0xd401; }
+    size_t i; for (i = 0; i < FILE_LIMIT && files[i].handle; i++) {}
+    if (i == FILE_LIMIT) { pthread_mutex_unlock(&lock); close(fd); return 0xd401; }
     files[i].fd = fd; files[i].handle = next_handle++;
     *out = files[i].handle; pthread_mutex_unlock(&lock);
     fprintf(stderr, "open resource: %s (%lld bytes)\n", path, (long long)st.st_size);
     return 0;
 }
 static int fd_for(uint64_t handle) {
-    if (handle) for (size_t i = 0; i < 64; i++) if (files[i].handle == handle) return files[i].fd;
+    if (handle) for (size_t i = 0; i < FILE_LIMIT; i++) if (files[i].handle == handle) return files[i].fd;
     return -1;
 }
 static unsigned read_file(size_t *out, uint64_t handle, int64_t offset, void *buffer, size_t size) {
@@ -81,7 +82,7 @@ static unsigned file_size(int64_t *out, uint64_t handle) {
 }
 static void close_file(uint64_t handle) {
     pthread_mutex_lock(&lock);
-    if (handle) for (size_t i = 0; i < 64; i++) if (files[i].handle == handle) {
+    if (handle) for (size_t i = 0; i < FILE_LIMIT; i++) if (files[i].handle == handle) {
         close(files[i].fd); files[i].handle = 0; break;
     }
     pthread_mutex_unlock(&lock);

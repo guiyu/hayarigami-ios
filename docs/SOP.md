@@ -98,3 +98,20 @@ python scripts/verify_audio.py --romfs .local/romfs \
 ```
 
 输出目录必须新建且位于 `.local/`。测试临时音频仅本地使用，成功后删除，保留摘要 JSON；失败目录供诊断，不作为可发布产物。
+
+
+## 本地着色器分析与转换
+
+```sh
+"$PY" scripts/extract_shaders.py .local/run1/main.bin --out "$PWD/.local/shaders/source"
+"$PY" scripts/build_shaders.py --source .local/shaders/source \
+  --dependencies /absolute/path/to/audited/generic/translator/libraries \
+  --out "$PWD/.local/shaders/metal"
+xcrun clang -fobjc-arc tests/probe_shader.m -framework Foundation -framework Metal \
+  -o .local/runtime/probe-shader
+.local/runtime/probe-shader .local/shaders/metal/VERTEX_KEY.metal .local/shaders/metal/FRAGMENT_KEY.metal
+```
+
+依赖目录须含 Ryujinx.Common.dll、Ryujinx.Graphics.Shader.dll、Spv.Generator.dll；工具报告记录 SHA-256。这是外部本地依赖，仓库没有附带其源码或二进制。当前128组中1组几何阶段拒绝，整批命令返回失败并保留每项报告；不应改成忽略失败。可用重复的 `--key` 对指定项独立构建。当前示例 GPU 探针针对最初基本二维采样 vertex/fragment 配对，不是任意 shader 自动验收。
+
+诊断启动在进入 SDK Start 时设置120秒上限。默认不输出每次已知系统调用；需要详细定位时设置 `HY_TRACE_SVC=1`，保留本地日志。主动 Break 和未实现接口仍输出停止信息与可用调用栈。

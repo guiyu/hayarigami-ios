@@ -5,7 +5,7 @@ OUT="$ROOT/.local/ios-compile"
 mkdir -p "$OUT"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 python3 "$ROOT/scripts/generate_nvn_gates.py" --program "$ROOT/.local/run1/main.bin" --out "$ROOT/.local/gfx-generated"
-for source in loader kernel services input threads filesystem signed_image; do
+for source in loader kernel services input account threads filesystem signed_image; do
     xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=26.0 \
         -std=c11 -Wall -Wextra -Werror -O1 -c "$ROOT/src/runtime/$source.c" -o "$OUT/$source.o"
 done
@@ -19,7 +19,7 @@ for source in dsp_adpcm renderer output mix; do
     xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=26.0 \
         -std=c11 -Wall -Wextra -Werror -O1 -c "$ROOT/src/audio/$source.c" -o "$OUT/$source.o"
 done
-for source in nvn_tex nvn_deswizzle; do
+for source in bc7 nvn_tex nvn_deswizzle; do
     xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=26.0 \
         -std=c11 -Wall -Wextra -Werror -O1 -c "$ROOT/src/gfx/$source.c" -o "$OUT/$source.o"
 done
@@ -27,7 +27,7 @@ xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=2
     -c "$ROOT/src/runtime/gate.S" -o "$OUT/gate.o"
 xcrun --sdk iphoneos libtool -static -o "$OUT/libhayarigami-runtime.a" \
     "$OUT/loader.o" "$OUT/kernel.o" "$OUT/services.o" "$OUT/input.o" \
-    "$OUT/threads.o" "$OUT/filesystem.o" "$OUT/signed_image.o" "$OUT/gate.o" \
+    "$OUT/account.o" "$OUT/threads.o" "$OUT/filesystem.o" "$OUT/signed_image.o" "$OUT/gate.o" \
     "$OUT/dsp_adpcm.o" "$OUT/renderer.o" "$OUT/output.o" "$OUT/mix.o" \
-    "$OUT/platform.o" "$OUT/nvn_tex.o" "$OUT/nvn_deswizzle.o" "$OUT/nvn_names.o" "$OUT/nvn_gates.o"
+    "$OUT/platform.o" "$OUT/bc7.o" "$OUT/nvn_tex.o" "$OUT/nvn_deswizzle.o" "$OUT/nvn_names.o" "$OUT/nvn_gates.o"
 echo 'PASS: runtime sources compile for iOS arm64 (compile check only; not an App or IPA)'

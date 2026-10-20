@@ -8,8 +8,8 @@
 typedef struct {
     pthread_t pthread;
     pthread_cond_t changed;
-    uintptr_t entry, argument, stack, wait_address;
-    uint32_t handle, wait_tag;
+    uintptr_t entry, argument, stack, wait_address, condition_key;
+    uint32_t handle, wait_tag, wait_result;
     int priority, core, started, exited, waiting;
     uint64_t core_mask;
 } Thread;
@@ -39,6 +39,16 @@ static void *run(void *argument) {
     Thread *t = argument;
     pthread_setspecific(current_key, t); hy_thread_init();
     hy_thread_enter(t->entry, t->argument, t->stack);
+}
+// Called with the host registry lock held. Transfer guest mutex ownership
+// before waking its waiter; an unlocked interval would allow a lost handoff.
+static void unlock_address(uintptr_t address) {
+    Thread *next=NULL; unsigned count=0;
+    for (size_t i=0;i<64;i++) if (threads[i] && threads[i]->waiting==1 && threads[i]->wait_address==address) {
+        if (!next || threads[i]->priority<next->priority) next=threads[i]; count++;
+    }
+    atomic_store((_Atomic uint32_t *)address,next ? next->wait_tag | (count>1 ? 0x40000000 : 0) : 0);
+    if (next) { next->waiting=0; pthread_cond_signal(&next->changed); }
 }
 int hy_thread_syscall(unsigned number, uint64_t *r) {
     switch (number) {
@@ -115,15 +125,66 @@ int hy_thread_syscall(unsigned number, uint64_t *r) {
         pthread_mutex_unlock(&lock); r[0] = 0; return 1;
     }
     case 0x1b: {
-        _Atomic uint32_t *word = (_Atomic uint32_t *)(uintptr_t)r[0];
+        pthread_mutex_lock(&lock); unlock_address(r[0]);
+        pthread_mutex_unlock(&lock); r[0]=0; return 1;
+    }
+    case 0x1c: {
+        Thread *t=pthread_getspecific(current_key);
+        if (!t || (r[0]&3) || (r[1]&3)) hy_fail("invalid condition wait");
         pthread_mutex_lock(&lock);
-        Thread *next = NULL; unsigned count = 0;
-        for (size_t i = 0; i < 64; i++) if (threads[i] && threads[i]->waiting == 1 && threads[i]->wait_address == r[0]) {
-            if (!next || threads[i]->priority < next->priority) next = threads[i]; count++;
+        atomic_store((_Atomic uint32_t *)(uintptr_t)r[1],1);
+        unlock_address(r[0]);
+        uint32_t result=0;
+        int64_t ns=(int64_t)r[3];
+        if (!ns) result=0xea01;
+        else {
+            t->wait_address=r[0]; t->condition_key=r[1]; t->wait_tag=r[2];
+            t->wait_result=0; t->waiting=3;
+            struct timespec deadline; clock_gettime(CLOCK_MONOTONIC,&deadline);
+            if (ns>0) { deadline.tv_sec+=ns/1000000000; deadline.tv_nsec+=ns%1000000000;
+                deadline.tv_sec+=deadline.tv_nsec/1000000000; deadline.tv_nsec%=1000000000; }
+            while (t->waiting) {
+                int code;
+                if (ns<0) code=pthread_cond_wait(&t->changed,&lock);
+                else {
+                    struct timespec now, remaining; clock_gettime(CLOCK_MONOTONIC,&now);
+                    remaining.tv_sec=deadline.tv_sec-now.tv_sec; remaining.tv_nsec=deadline.tv_nsec-now.tv_nsec;
+                    if (remaining.tv_nsec<0) { remaining.tv_sec--; remaining.tv_nsec+=1000000000; }
+                    code=remaining.tv_sec<0 ? ETIMEDOUT : pthread_cond_timedwait_relative_np(&t->changed,&lock,&remaining);
+                }
+                if (code==ETIMEDOUT && t->waiting) { t->waiting=0; t->condition_key=0; t->wait_result=0xea01; }
+                else if (code && code!=ETIMEDOUT) hy_fail("condition wait failed");
+            }
+            result=t->wait_result;
         }
-        atomic_store(word, next ? next->wait_tag | (count > 1 ? 0x40000000 : 0) : 0);
-        if (next) { next->waiting = 0; pthread_cond_signal(&next->changed); }
-        pthread_mutex_unlock(&lock); r[0] = 0; return 1;
+        pthread_mutex_unlock(&lock); r[0]=result; return 1;
+    }
+    case 0x1d: {
+        uintptr_t key=r[0]; int count=(int)r[1];
+        if (key&3) hy_fail("unaligned condition key");
+        pthread_mutex_lock(&lock);
+        for (int sent=0;count<=0 || sent<count;sent++) {
+            Thread *next=NULL;
+            for (size_t i=0;i<64;i++) if (threads[i] && threads[i]->waiting==3 && threads[i]->condition_key==key)
+                if (!next || threads[i]->priority<next->priority) next=threads[i];
+            if (!next) break;
+            next->condition_key=0;
+            _Atomic uint32_t *word=(_Atomic uint32_t *)next->wait_address;
+            uint32_t previous=atomic_load(word);
+            for (;;) {
+                uint32_t value=previous ? previous|0x40000000 : next->wait_tag;
+                if (atomic_compare_exchange_weak(word,&previous,value)) break;
+            }
+            if (!previous) { next->waiting=0; pthread_cond_signal(&next->changed); }
+            else {
+                if (!get(previous&~0x40000000u)) hy_fail("condition mutex owner is invalid");
+                next->waiting=1;
+            }
+        }
+        int remaining=0;
+        for (size_t i=0;i<64;i++) if (threads[i] && threads[i]->waiting==3 && threads[i]->condition_key==key) remaining=1;
+        if (!remaining) atomic_store((_Atomic uint32_t *)key,0);
+        pthread_mutex_unlock(&lock); r[0]=0; return 1;
     }
     case 0x34: {
         Thread *t = pthread_getspecific(current_key);

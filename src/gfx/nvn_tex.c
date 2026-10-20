@@ -1,13 +1,8 @@
 // NVN 贴图的存储尺寸 / 对齐 / 各级偏移（Tegra X1 块线性布局）。
 // 算法移植自 deko3d source/dk_image.cpp（zlib 许可，Copyright (C) 2018-2020 fincs）：
 //   一个 GOB = 64 字节 × 8 行 = 512 字节；块高（tileH，单位 GOB）按「高度×1.5」挑；各级按块对齐累加。
-// 游戏的预排布贴图（SetPackagedTextureLayout）带 8 字节布局参数：第 0 字节 = 块高 log2（参考工程的 16 例对照得出，非本作验证，
-// 其中 4 例与自动算法不同），有它时以它为准。
-// Storage size / alignment / per-level offsets of NVN textures (Tegra X1 block-linear layout).
-// The algorithm is ported from deko3d source/dk_image.cpp (zlib license, Copyright (C) 2018-2020 fincs):
-//   one GOB = 64 bytes × 8 rows = 512 bytes; the block height (tileH, in GOBs) is picked by 'height×1.5'; levels are accumulated with block alignment.
-// The game's packaged textures (SetPackagedTextureLayout) carry 8 bytes of layout parameters: byte 0 = log2 of the block height (derived from 16 cases in the reference project, not this title;
-// 4 of which differ from the automatic algorithm); when present it takes precedence.
+// Packaged layouts use low-nibble H, next-nibble D, next-nibble W in a 16-bit word,
+// verified against this title's SDK setters. Only supported 2D layouts are admitted by the host.
 #include "nvn_tex.h"
 
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // 每块字节、块宽、块高（非压缩格式块宽高 = 1） | Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
@@ -89,9 +84,9 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     shape(d, &dpl, &layered, &w, &h, &z);
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     o->bpb = t.bpb; o->tileW = o->tileH = o->tileD = 0; o->layers = layered ? z : 1;
-    // Sparse support is deliberately limited to the observed single-level 2D, 4/8-byte layouts.
+    // Sparse support is limited to SDK-verified single-level 2D power-of-two pixel sizes.
     if ((d->flags & 0x20) && (d->target!=1 || d->levels!=1 || d->depth!=1 ||
-        d->samples>1 || (t.bpb!=4 && t.bpb!=8) || t.bw!=1 || t.bh!=1 || d->pkg_block_h)) {
+        d->samples>1 || (t.bpb!=1 && t.bpb!=2 && t.bpb!=4 && t.bpb!=8 && t.bpb!=16))) {
         o->size=o->layer_size=0; o->align=0; return;
     }
     if (!t.bpb) { o->size = 0; o->align = 512; o->layer_size = 0; return; }
@@ -108,12 +103,13 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     unsigned tileH = 0, tileD = 0;
     if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2 + 7) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
-    // Original SDK 55.15 CPU layout: full sparse tiles are 64 KiB: 128x128 at 4 Bpp, 128x64 at 8 Bpp.
+    // Original SDK 55.15 CPU layout: 64 KiB tiles, from 256x256 at 1 Bpp to 128x64 at 8 Bpp.
     // A small single-level texture stays in the ordinary block-linear mip tail.
-    unsigned tileW=0;
-    unsigned sparseHeight=t.bpb==8 ? 64 : 128;
-    if ((d->flags & 0x20) && w>=128 && h>=sparseHeight) {
-        tileW=t.bpb==8 ? 4 : 3; tileH=t.bpb==8 ? 3 : 4;
+    unsigned tileW=d->pkg_block_w ? (unsigned)d->pkg_block_w-1 : 0;
+    unsigned sparseW=t.bpb==1 ? 2 : t.bpb>=8 ? 4 : 3;
+    unsigned sparseH=7-sparseW;
+    if (!d->pkg_block_h && (d->flags & 0x20) && w>=(64u<<sparseW)/t.bpb*t.bw && h>=(8u<<sparseH)*t.bh) {
+        tileW=sparseW; tileH=sparseH;
     }
     o->tileW=tileW; o->tileH = tileH; o->tileD = tileD;
     unsigned levels = d->levels ? d->levels : 1;

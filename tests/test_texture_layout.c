@@ -42,6 +42,16 @@ int main(void) {
         d.width=widths[k]; d.height=heights[k]; nvn_tex_layout(&d,&layout);
         assert(layout.size==depth_expected[k]);
     }
+    const uint64_t narrow_expected[2][10]={
+        {512,1024,16384,16384,16384,16384,16384,49152,2621440,122880},
+        {512,1024,32768,32768,32768,32768,32768,81920,4718592,245760}};
+    for (unsigned bpp=1;bpp<=2;bpp++) {
+        d.format=bpp==1 ? 1 : 5;
+        for (unsigned k=0;k<10;k++) {
+            d.width=widths[k];d.height=heights[k];nvn_tex_layout(&d,&layout);
+            assert(layout.size==narrow_expected[bpp-1][k]);
+        }
+    }
     d.format=0x3d;
     d.width=d.height=129; nvn_tex_layout(&d,&layout);
     storage=calloc(1,layout.size); uint8_t *source=malloc(129*129*4), *dest=malloc(129*129*4);
