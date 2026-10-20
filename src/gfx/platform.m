@@ -108,6 +108,12 @@ static uint32_t initialize_device(void *object, const void *builder) {
     fprintf(stderr, "NVN device created: flags=%#x\n", device_flags);
     return 1;
 }
+static uint64_t device_timestamp(const void *object,const HyCounterData *data) {
+    if (!object || !data) hy_fail("invalid timestamp conversion");
+    // The Metal adapter's counter writer must normalize GPU samples to ns.
+    // This reads existing data; it never substitutes a CPU clock for a GPU sample.
+    return data->timestamp;
+}
 static void set_depth(void *object, int mode) {
     (void)object;
     if (mode != 1) hy_fail("unsupported NVN depth mode: %d", mode);
@@ -177,7 +183,7 @@ static uint32_t pool_initialize(Pool **object, const PoolBuilder *b) {
 - (BOOL)usesPool:(Pool *)pool;
 @end
 @interface HyCommandLease : NSObject {
-@public uintptr_t begin, end; id resource;
+@public uintptr_t begin, end; uint32_t op; id resource;
 }
 @end
 @implementation HyCommandLease
@@ -209,9 +215,19 @@ static void command_release_pool(Pool *pool) {
 static void command_keep(void *payload,size_t size,id resource) {
     HyCommandLease *lease=[HyCommandLease new];
     lease->begin=(uintptr_t)payload-8;lease->end=lease->begin+((size+15)&~(size_t)7);lease->resource=resource;
+    memcpy(&lease->op,(const uint8_t *)payload-8,sizeof lease->op);
     pthread_mutex_lock(&command_lock);
     if (!command_leases) command_leases=[NSMutableArray new];
     [command_leases addObject:lease];pthread_mutex_unlock(&command_lock);
+}
+static id command_resource(uint64_t address,const void *token,size_t size,uint32_t op) {
+    id resource=nil;pthread_mutex_lock(&command_lock);
+    for (HyCommandLease *lease in command_leases) if (lease->begin==address &&
+        size==lease->end-lease->begin && op==lease->op &&
+        (__bridge void *)lease->resource==token) { resource=lease->resource;break; }
+    pthread_mutex_unlock(&command_lock);
+    if (!resource) hy_fail("recorded command resource was overwritten, altered or released");
+    return resource;
 }
 static uint32_t command_initialize(HyCommands *c,void *d) {
     uint32_t result=hy_commands_init(c,d);c->overwrite=command_overwrite;return result;
@@ -378,18 +394,38 @@ static void queue_finalize(void **object) {
     id q = (__bridge_transfer id)*object; (void)q; *object = NULL;
 }
 // The guest sync object stores one host pointer. Metal owns submitted command buffers.
-typedef struct { pthread_mutex_t lock; void *command, *event; } GpuSync;
+typedef struct { pthread_mutex_t lock; void *command, *event; unsigned references; } GpuSync;
 static uint64_t monotonic_ns(void);
 static uint32_t sync_initialize(GpuSync **object, void *d) {
     if (!device || !d) hy_fail("sync device missing");
     GpuSync *sync=calloc(1,sizeof *sync); if (!sync) return 0;
-    pthread_mutex_init(&sync->lock,NULL); *object=sync; return 1;
+    pthread_mutex_init(&sync->lock,NULL);sync->references=1; *object=sync; return 1;
 }
-static void sync_finalize(GpuSync **object) {
-    GpuSync *sync=*object; if (!sync) hy_fail("invalid sync finalize");
+static void sync_release(GpuSync *sync) {
+    pthread_mutex_lock(&sync->lock);
+    if (!sync->references) hy_fail("invalid sync reference count");
+    if (--sync->references) { pthread_mutex_unlock(&sync->lock);return; }
     id command=(__bridge_transfer id)sync->command; (void)command;
     id event=(__bridge_transfer id)sync->event; (void)event;
-    pthread_mutex_destroy(&sync->lock); free(sync); *object=NULL;
+    pthread_mutex_unlock(&sync->lock);pthread_mutex_destroy(&sync->lock);free(sync);
+}
+static void sync_finalize(GpuSync **object) {
+    GpuSync *sync=*object;if (!sync) hy_fail("invalid sync finalize");
+    *object=NULL;sync_release(sync);
+}
+@interface HyRecordedSync : NSObject {
+@public GpuSync *sync; int condition,flags;
+}
+@end
+@implementation HyRecordedSync
+- (void)dealloc { if (sync) sync_release(sync); }
+@end
+static void command_fence(HyCommands *c,GpuSync *const *object,int condition,int flags) {
+    if (!object || !*object || condition<0 || condition>1 || (flags&~1)) hy_fail("invalid recorded fence");
+    HyRecordedSync *fence=[HyRecordedSync new];fence->sync=*object;fence->condition=condition;fence->flags=flags;
+    pthread_mutex_lock(&fence->sync->lock);fence->sync->references++;pthread_mutex_unlock(&fence->sync->lock);
+    void *value=(__bridge void *)fence;void *record=hy_commands_record(c,HY_FENCE_SYNC,sizeof value);
+    memcpy(record,&value,sizeof value);command_keep(record,sizeof value,fence);
 }
 static void queue_fence(void *const *object, GpuSync **sync_object, int condition, int flags) {
     if (condition<0 || condition>1 || (flags&~1)) hy_fail("unsupported sync condition/flags");
@@ -452,8 +488,7 @@ static void command_memory(HyCommands *c, Pool *const *object, ptrdiff_t offset,
     if (pool) { pthread_mutex_lock(&pool->lock);pool->buffers--;pthread_mutex_unlock(&pool->lock); }
 }
 @end
-static void command_uniform(HyCommands *c,int stage,int index,uint64_t address,size_t length) {
-    if (stage<0 || stage>5 || index<0 || index>=32) hy_fail("unsupported uniform stage/index");
+static HyBoundBuffer *bound_buffer(int stage,int index,uint64_t address,size_t length) {
     HyBoundBuffer *bound=[HyBoundBuffer new];bound->stage=stage;bound->index=index;bound->length=length;
     if (length) {
         pthread_mutex_lock(&pools_lock);
@@ -466,10 +501,38 @@ static void command_uniform(HyCommands *c,int stage,int index,uint64_t address,s
             }
         }
         pthread_mutex_unlock(&pools_lock);
-        if (!bound->pool) hy_fail("uniform buffer outside live memory pools");
+        if (!bound->pool) hy_fail("%s buffer outside live memory pools",stage==-1 ? "vertex" : stage==-2 ? "index" : "uniform");
     }
-    void *value=(__bridge void *)bound;void *record=hy_commands_record(c,HY_UNIFORM_BUFFER,sizeof value);
+    return bound;
+}
+static void command_bind_buffer(HyCommands *c,uint32_t opcode,int stage,int index,uint64_t address,size_t length) {
+    HyBoundBuffer *bound=bound_buffer(stage,index,address,length);
+    void *value=(__bridge void *)bound;void *record=hy_commands_record(c,opcode,sizeof value);
     memcpy(record,&value,sizeof value);command_keep(record,sizeof value,bound);
+}
+static void command_uniform(HyCommands *c,int stage,int index,uint64_t address,size_t length) {
+    if (stage<0 || stage>5 || index<0 || index>=32) hy_fail("unsupported uniform stage/index");
+    command_bind_buffer(c,HY_UNIFORM_BUFFER,stage,index,address,length);
+}
+typedef struct { uint64_t address,size; } HyGpuBufferRange;
+static void command_vertex_buffers(HyCommands *c,int first,int count,const HyGpuBufferRange *ranges) {
+    if (first<0 || first>16 || count<0 || count>16-first || (count && !ranges)) hy_fail("unsupported vertex buffer range");
+    for (int i=0;i<count;i++) command_bind_buffer(c,HY_VERTEX_BUFFER,-1,first+i,ranges[i].address,ranges[i].size);
+}
+@interface HyDrawIndexed : NSObject <HyPoolReference> {
+@public HyBoundBuffer *indices; int primitive,index_type,count;
+}
+@end
+@implementation HyDrawIndexed
+- (BOOL)usesPool:(Pool *)pool { return [indices usesPool:pool]; }
+@end
+static void command_draw_elements(HyCommands *c,int primitive,int type,int count,uint64_t address) {
+    if (primitive<0 || primitive>14 || type<0 || type>2 || count<0 || (count && (address&((1u<<type)-1))))
+        hy_fail("unsupported indexed draw parameters");
+    HyDrawIndexed *draw=[HyDrawIndexed new];draw->primitive=primitive;draw->index_type=type;draw->count=count;
+    draw->indices=bound_buffer(-2,0,address,(size_t)count<<type);
+    void *value=(__bridge void *)draw;void *record=hy_commands_record(c,HY_DRAW_ELEMENTS,sizeof value);
+    memcpy(record,&value,sizeof value);command_keep(record,sizeof value,draw);
 }
 static void command_program(HyCommands *c,void *const *object,uint32_t stages) {
     if ((stages&~63u) || (object && !*object)) hy_fail("invalid bound program/stages");
@@ -662,6 +725,8 @@ static void texture_finalize(Texture *t) {
     if (!t->backing) hy_fail("invalid texture finalize");
     backing_release(t->backing); memset(t, 0, sizeof *t);
 }
+static int texture_width_value(const Texture *t) { return t->builder.width; }
+static int texture_height_value(const Texture *t) { return t->builder.height; }
 static void texture_label(Texture *t, const char *label) {
     id<MTLTexture> image=(__bridge id<MTLTexture>)t->image;
     image.label=label ? [NSString stringWithUTF8String:label] : nil;
@@ -716,7 +781,7 @@ static void register_texture(const DescriptorPool *pool, int index, const Textur
     slot->resource=(__bridge_retained void *)image; slot->view=t->backing;
 }
 @interface HyTargetImage : NSObject {
-@public id<MTLTexture> image; TextureBacking *backing;
+@public id<MTLTexture> image; TextureBacking *backing; int format;
 }
 @end
 @implementation HyTargetImage
@@ -733,14 +798,40 @@ static void register_texture(const DescriptorPool *pool, int index, const Textur
     return NO;
 }
 @end
-static HyTargetImage *target_image(const Texture *texture,const TextureView *view,int depth) {
-    id<MTLTexture> image=texture_view(texture,view);
-    if (!(image.usage&MTLTextureUsageRenderTarget) || image.mipmapLevelCount!=1 ||
-        ((texture->builder.format==0x34 || texture->builder.format==0x36)!=!!depth))
-        hy_fail("unsupported render target format/view");
-    HyTargetImage *snapshot=[HyTargetImage new];snapshot->image=image;snapshot->backing=texture->backing;
+static HyTargetImage *image_snapshot(const Texture *texture,const TextureView *view) {
+    HyTargetImage *snapshot=[HyTargetImage new];snapshot->image=texture_view(texture,view);snapshot->backing=texture->backing;
+    snapshot->format=view && (view->fields&4) ? view->format : texture->builder.format;
     pthread_mutex_lock(&snapshot->backing->pool->lock);snapshot->backing->references++;
     pthread_mutex_unlock(&snapshot->backing->pool->lock);return snapshot;
+}
+static HyTargetImage *target_image(const Texture *texture,const TextureView *view,int depth) {
+    HyTargetImage *snapshot=image_snapshot(texture,view);id<MTLTexture> image=snapshot->image;
+    if (!(image.usage&MTLTextureUsageRenderTarget) || image.mipmapLevelCount!=1 ||
+        ((snapshot->format==0x34 || snapshot->format==0x36)!=!!depth))
+        hy_fail("unsupported render target format/view");
+    return snapshot;
+}
+@interface HyTextureCopy : NSObject <HyPoolReference> {
+@public HyTargetImage *source,*destination; HyCopyRegion from,to; uint32_t flags;
+}
+@end
+@implementation HyTextureCopy
+- (BOOL)usesPool:(Pool *)pool { return source->backing->pool==pool || destination->backing->pool==pool; }
+@end
+static void check_copy_region(id<MTLTexture> image,const HyCopyRegion *region) {
+    if (!region || region->x<0 || region->y<0 || region->z || region->width<1 || region->height<1 || region->depth!=1 ||
+        (NSUInteger)region->x>image.width || (NSUInteger)region->y>image.height ||
+        (NSUInteger)region->width>image.width-(NSUInteger)region->x || (NSUInteger)region->height>image.height-(NSUInteger)region->y)
+        hy_fail("texture copy region outside image bounds");
+}
+static void command_copy_texture(HyCommands *c,const Texture *source,const TextureView *source_view,const HyCopyRegion *from,
+                                 const Texture *destination,const TextureView *destination_view,const HyCopyRegion *to,uint32_t flags) {
+    HyTextureCopy *copy=[HyTextureCopy new];copy->source=image_snapshot(source,source_view);
+    copy->destination=image_snapshot(destination,destination_view);
+    check_copy_region(copy->source->image,from);check_copy_region(copy->destination->image,to);
+    copy->from=*from;copy->to=*to;copy->flags=flags;
+    void *value=(__bridge void *)copy;void *record=hy_commands_record(c,HY_COPY_TEXTURE,sizeof value);
+    memcpy(record,&value,sizeof value);command_keep(record,sizeof value,copy);
 }
 static void command_targets(HyCommands *c,int count,Texture *const *textures,const TextureView *const *views,
                             const Texture *depth,const TextureView *depth_view) {
@@ -808,6 +899,14 @@ static uint32_t window_initialize(Window *w, const WindowBuilder *b) {
     *w=(Window){.builder=*b,.crop={0,0,first->builder.width,first->builder.height}};
     fprintf(stderr,"NVN window: %d textures, %dx%d\n",b->count,first->builder.width,first->builder.height);
     return 1;
+}
+static int window_acquire(Window *w,GpuSync **sync,int *index) {
+    if (!sync || !*sync || !index) hy_fail("invalid window acquisition");
+    // Initial headless buffers have never been presented and are available.
+    // Recycling must wait for a real presentation fence; never silently wrap.
+    if (w->next>=w->builder.count) hy_fail("window presentation/recycling not implemented");
+    void *host_queue=(__bridge void *)queue;queue_fence(&host_queue,sync,0,0);
+    *index=w->next++;return 0;
 }
 static void window_crop(Window *w, int x, int y, int width, int height) {
     Texture *texture=w->builder.textures[0];
@@ -896,9 +995,115 @@ static void display_clear(void *event) {
     void (*original)(void *) = hy_symbol("_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE");
     original(event);
 }
+static void command_validate(uint32_t op,const void *payload,size_t size) {
+    size_t expected;
+    switch(op) {
+    case HY_BEGIN:case HY_END:expected=0;break;
+    case HY_TEXTURE_POOL:case HY_SAMPLER_POOL:expected=sizeof(DescriptorPool);break;
+    case HY_MULTISAMPLE_STATE:expected=24;break;
+    case HY_REPORT_COUNTER:expected=sizeof(HyCounterRecord);break;
+    case HY_BIND_PROGRAM:expected=sizeof(HyProgramRecord);break;
+    case HY_CLEAR_COLOR:expected=sizeof(HyClearColorRecord);break;
+    case HY_CLEAR_DEPTH:expected=sizeof(HyClearDepthRecord);break;
+    case HY_VIEWPORT:case HY_SCISSOR:expected=16;break;
+    case HY_VERTEX_ATTRIBUTES:case HY_VERTEX_STREAMS: {
+        uint32_t count;
+        if(size<8) hy_fail("invalid command payload length");
+        memcpy(&count,payload,4);
+        if(count>16) hy_fail("invalid command vertex state count");
+        expected=8+(size_t)count*(op==HY_VERTEX_ATTRIBUTES ? 4 : 8);break;
+    }
+    case HY_JUMP:case HY_COLOR_STATE:case HY_BLEND_STATE:case HY_CHANNEL_MASK_STATE:
+    case HY_POLYGON_STATE:case HY_DEPTH_STENCIL_STATE:case HY_DEPTH_RANGE:case HY_DEPTH_CLAMP:
+    case HY_RENDER_TARGETS:case HY_UNIFORM_BUFFER:case HY_STENCIL_MASK:case HY_STENCIL_VALUE_MASK:
+    case HY_ALPHA_REF:case HY_STENCIL_REF:case HY_VERTEX_BUFFER:case HY_DRAW_ELEMENTS:
+    case HY_COPY_TEXTURE:case HY_TILED_CACHE:case HY_BARRIER:case HY_FENCE_SYNC:expected=8;break;
+    default:hy_fail("unknown recorded command opcode: %u",op);
+    }
+    if(size!=((expected+7)&~(size_t)7)) hy_fail("invalid command payload length");
+}
+static void queue_submit(void *const *object,int count,const uint64_t *handles) {
+    if (!object || !*object || count<0 || count>64 || (count && !handles)) hy_fail("invalid command submission");
+    for (int list=0;list<count;list++) {
+        uint64_t address=handles[list];fprintf(stderr,"SUBMIT list=%d\n",list);
+        for (unsigned step=0;;step++) {
+            if (step==4096 || (address&7)) hy_fail("command traversal limit/alignment");
+            NSData *header_bytes=pool_copy(address,8);HyRecord header;memcpy(&header,header_bytes.bytes,8);
+            if (header.size<8 || (header.size&7) || header.size>1048576) hy_fail("invalid recorded command size");
+            NSData *bytes=pool_copy(address,header.size);const uint8_t *payload=(const uint8_t *)bytes.bytes+8;
+            size_t payload_size=header.size-8;command_validate(header.op,payload,payload_size);
+            fprintf(stderr,"  op=%u size=%u",header.op,header.size);
+            if (!step && header.op!=HY_BEGIN) hy_fail("command handle does not start with BEGIN");
+            switch (header.op) {
+            case HY_BIND_PROGRAM: {
+                if (payload_size<sizeof(HyProgramRecord)) hy_fail("short program command");
+                HyProgramRecord record;memcpy(&record,payload,sizeof record);
+                NSArray *shaders=command_resource(address,record.shaders,header.size,header.op);
+                fprintf(stderr," program stages=%#x",record.stages);
+                for (HyShader *shader in shaders) fprintf(stderr," shader=%u:%s",shader->stage,shader->key);
+                break;
+            }
+            case HY_RENDER_TARGETS: case HY_UNIFORM_BUFFER: case HY_VERTEX_BUFFER: case HY_DRAW_ELEMENTS:
+            case HY_COPY_TEXTURE: case HY_FENCE_SYNC: {
+                if (payload_size<8) hy_fail("short resource command");
+                void *token;memcpy(&token,payload,8);id resource=command_resource(address,token,header.size,header.op);
+                if (header.op==HY_RENDER_TARGETS) {
+                    HyRenderTargets *targets=resource;
+                    for (id color in targets->colors) if (color!=[NSNull null]) {
+                        HyTargetImage *image=color;fprintf(stderr," color=%#x:%lux%lu",image->format,(unsigned long)image->image.width,(unsigned long)image->image.height);
+                    }
+                    if (targets->depth) fprintf(stderr," depth=%#x",targets->depth->format);
+                } else if (header.op==HY_UNIFORM_BUFFER || header.op==HY_VERTEX_BUFFER) {
+                    HyBoundBuffer *buffer=resource;fprintf(stderr," stage=%d index=%d offset=%zu length=%zu",buffer->stage,buffer->index,buffer->offset,buffer->length);
+                } else if (header.op==HY_DRAW_ELEMENTS) {
+                    HyDrawIndexed *draw=resource;fprintf(stderr," draw primitive=%d index=%d count=%d offset=%zu",draw->primitive,draw->index_type,draw->count,draw->indices->offset);
+                } else if (header.op==HY_COPY_TEXTURE) {
+                    HyTextureCopy *copy=resource;fprintf(stderr," copy %#x->%#x %dx%d->%dx%d flags=%#x",copy->source->format,copy->destination->format,copy->from.width,copy->from.height,copy->to.width,copy->to.height,copy->flags);
+                } else {
+                    HyRecordedSync *sync=resource;fprintf(stderr," fence condition=%d flags=%#x",sync->condition,sync->flags);
+                }
+                break;
+            }
+            case HY_VERTEX_ATTRIBUTES: case HY_VERTEX_STREAMS:
+                fprintf(stderr," vertex-state:");for (size_t k=0;k<payload_size;k+=4) { uint32_t value;memcpy(&value,payload+k,4);fprintf(stderr," %x",value); }break;
+            case HY_MULTISAMPLE_STATE: case HY_COLOR_STATE: case HY_BLEND_STATE: case HY_CHANNEL_MASK_STATE:
+            case HY_POLYGON_STATE: case HY_DEPTH_STENCIL_STATE:
+                fprintf(stderr," state:");for (size_t k=0;k<payload_size;k++) fprintf(stderr," %02x",payload[k]);
+                if (header.op==HY_COLOR_STATE) fprintf(stderr," logic=%d alpha=%d blend0=%d",
+                    ((int (*)(const void *))lookup("nvnColorStateGetLogicOp"))(payload),
+                    ((int (*)(const void *))lookup("nvnColorStateGetAlphaTest"))(payload),
+                    ((int (*)(const void *,int))lookup("nvnColorStateGetBlendEnable"))(payload,0));
+                if (header.op==HY_MULTISAMPLE_STATE) fprintf(stderr," samples=%d enabled=%d",
+                    ((int (*)(const void *))lookup("nvnMultisampleStateGetSamples"))(payload),
+                    ((int (*)(const void *))lookup("nvnMultisampleStateGetMultisampleEnable"))(payload));
+                if (header.op==HY_POLYGON_STATE) fprintf(stderr," cull=%d front=%d polygon=%d offset=%d",
+                    ((int (*)(const void *))lookup("nvnPolygonStateGetCullFace"))(payload),
+                    ((int (*)(const void *))lookup("nvnPolygonStateGetFrontFace"))(payload),
+                    ((int (*)(const void *))lookup("nvnPolygonStateGetPolygonMode"))(payload),
+                    ((int (*)(const void *))lookup("nvnPolygonStateGetPolygonOffsetEnables"))(payload));
+                if (header.op==HY_DEPTH_STENCIL_STATE) fprintf(stderr," depth-test=%d write=%d func=%d stencil=%d",
+                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthTestEnable"))(payload),
+                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthWriteEnable"))(payload),
+                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetDepthFunc"))(payload),
+                    ((int (*)(const void *))lookup("nvnDepthStencilStateGetStencilTestEnable"))(payload));
+                break;
+            case HY_ALPHA_REF: {float value;memcpy(&value,payload,4);fprintf(stderr," alpha-ref=%g",value);break;}
+            case HY_DEPTH_RANGE: {float range[2];memcpy(range,payload,8);fprintf(stderr," depth-range=%g,%g",range[0],range[1]);break;}
+            case HY_VIEWPORT: case HY_SCISSOR: {int rect[4];memcpy(rect,payload,16);fprintf(stderr," rectangle=%d,%d %dx%d",rect[0],rect[1],rect[2],rect[3]);break;}
+            default:break;
+            }
+            fputc('\n',stderr);
+            if (header.op==HY_END) break;
+            if (header.op==HY_JUMP) { if (payload_size!=8) hy_fail("invalid command jump");memcpy(&address,payload,8); }
+            else address+=header.size;
+        }
+    }
+    hy_fail("Metal command replay not implemented (submission inspected)");
+}
 static void *lookup(const char *name) {
     static const struct { const char *name; void *fn; } functions[] = {
         {"nvnDeviceGetProcAddress", get_proc}, {"nvnDeviceGetInteger", integer},
+        {"nvnDeviceGetTimestampInNanoseconds", device_timestamp},
         {"nvnProgramInitialize", program_initialize}, {"nvnProgramFinalize", program_finalize},
         {"nvnProgramSetShaders", program_shaders},
         {"nvnProgramSetDebugLabel", program_label},
@@ -935,6 +1140,7 @@ static void *lookup(const char *name) {
         {"nvnSyncInitialize", sync_initialize}, {"nvnSyncFinalize", sync_finalize},
         {"nvnSyncWait", sync_wait}, {"nvnQueueFenceSync", queue_fence}, {"nvnQueueWaitSync", queue_wait},
         {"nvnQueueFinish", queue_finish}, {"nvnQueueFinalize", queue_finalize},
+        {"nvnQueueSubmitCommands", queue_submit},
         {"nvnQueueFlush", queue_finish}, // Synchronous flush until asynchronous submission is implemented.
         {"nvnCommandBufferReportCounter", command_counter},
         {"nvnCommandBufferSetDepthRange", hy_commands_depth_range},
@@ -957,9 +1163,16 @@ static void *lookup(const char *name) {
         {"nvnCommandBufferSetStencilRef", hy_commands_stencil_ref},
         {"nvnCommandBufferBindVertexAttribState", hy_commands_attributes},
         {"nvnCommandBufferBindVertexStreamState", hy_commands_streams},
+        {"nvnCommandBufferBindVertexBuffers", command_vertex_buffers},
+        {"nvnCommandBufferDrawElements", command_draw_elements},
+        {"nvnCommandBufferCopyTextureToTexture", command_copy_texture},
+        {"nvnCommandBufferSetTiledCacheAction", hy_commands_tiled_cache},
+        {"nvnCommandBufferBarrier", hy_commands_barrier},
+        {"nvnCommandBufferFenceSync", command_fence},
         {"nvnCommandBufferSetMemoryCallback", hy_commands_callback}, {"nvnCommandBufferSetMemoryCallbackData", hy_commands_context},
         {"nvnCommandBufferAddCommandMemory", command_memory}, {"nvnCommandBufferAddControlMemory", hy_commands_control},
         {"nvnCommandBufferBeginRecording", hy_commands_begin}, {"nvnCommandBufferEndRecording", hy_commands_end},
+        {"nvnTextureGetWidth", texture_width_value}, {"nvnTextureGetHeight", texture_height_value},
         {"nvnTextureBuilderSetDevice", texture_device}, {"nvnTextureBuilderSetDefaults", texture_defaults},
         {"nvnTextureBuilderSetFlags", texture_flags}, {"nvnTextureBuilderSetTarget", texture_target},
         {"nvnTextureBuilderSetWidth", texture_width}, {"nvnTextureBuilderSetHeight", texture_height},
@@ -982,6 +1195,7 @@ static void *lookup(const char *name) {
         {"nvnTextureViewSetDefaults", view_defaults}, {"nvnTextureViewSetLevels", view_levels},
         {"nvnTextureViewSetLayers", view_layers}, {"nvnTextureViewSetFormat", view_format}, {"nvnTextureViewSetTarget", view_target},
         {"nvnTextureViewSetDepthStencilMode", view_depth_mode}, {"nvnTextureViewSetSwizzle", view_swizzle},
+        {"nvnWindowAcquireTexture", window_acquire},
         {"nvnWindowSetPresentInterval", window_present_interval}, {"nvnWindowGetPresentInterval", window_get_interval},
         {"nvnWindowSetCrop", window_crop}, {"nvnWindowGetCrop", window_get_crop},
         {"nvnWindowBuilderSetDefaults", window_defaults}, {"nvnWindowBuilderSetDevice", window_device},

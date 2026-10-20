@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--dependencies', required=True, type=Path)
     parser.add_argument('--out', required=True, type=local_output)
     parser.add_argument('--key', action='append')
+    parser.add_argument('--alpha-test', choices=['always', 'greater-zero'], default='always')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     source = args.source.resolve()
@@ -47,7 +48,7 @@ def main():
                         raise ValueError(f'{part} hash mismatch')
                 base = args.out / key
                 run(['dotnet', str(args.out / 'translator/ShaderXlate.dll'),
-                     str(source / f'{key}.code.bin'), str(source / f'{key}.constants.bin'), str(base), record['stage']], log)
+                     str(source / f'{key}.code.bin'), str(source / f'{key}.constants.bin'), str(base), record['stage'], args.alpha_test], log)
                 run(['spirv-cross', str(base) + '.spv', '--msl', '--msl-ios', '--msl-version', '20400',
                      '--msl-decoration-binding', '--output', str(base) + '.metal'], log)
                 for sdk in ('macosx', 'iphoneos'):
@@ -55,6 +56,11 @@ def main():
                     run(['xcrun', '--sdk', sdk, 'metal', '-fmodules-cache-path=' + str(args.out / 'module-cache'),
                          '-fno-fast-math', '-c', str(base) + '.metal', '-o', air], log)
                     run(['xcrun', '--sdk', sdk, 'metallib', air, '-o', str(base) + f'.{sdk}.metallib'], log)
+                metadata_path = Path(str(base) + '.json')
+                metadata = json.loads(metadata_path.read_text())
+                metadata['MetalLibraries'] = {sdk: hashlib.sha256(Path(str(base) + f'.{sdk}.metallib').read_bytes()).hexdigest()
+                                              for sdk in ('macosx', 'iphoneos')}
+                metadata_path.write_text(json.dumps(metadata, indent=2) + '\n')
                 result['built'].append(record)
                 print(f'Built {record["stage"]} {key[:16]}', flush=True)
             except (RuntimeError, ValueError) as error:

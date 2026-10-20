@@ -158,3 +158,19 @@ Buffer 映射与地址保留 pool 内偏移；flush 在子范围内验证，仍�
 程序绑定现在持有不可变 shader 数组的命令 lease，原 Program 销毁或替换后仍可用；覆盖旧命令后释放。Uniform buffer 绑定保留 pool、Metal buffer、精确偏移和长度，并保留提交前的数据更新，不拍摄旧数据副本。资源池释放会使存放于其中或依赖该池的旧录制引用失效；跨池释放和越界绑定已通过合成 ASan/Metal 回归。尚不允许执行已因资源销毁失效的旧命令。
 
 已按 SDK ABI 录制模板读/写掩码与参考值、alpha参考值、16组顶点属性与顶点流；后续重放必须处理补足/禁用状态及着色器特化限制。新版模块最新真实启动停止于 `nvnCommandBufferBindVertexBuffers`。最新完整 native 回归（含弱导入、跨池资源、Program绑定）、22例Python与iOS编译均通过；仍未提交游戏绘图、未生成可安装IPA。
+
+## 首次提交命令与 GPU 探针（2026-10-20）
+
+新增 vertex/index buffer、texture-to-texture copy、tiled cache、barrier、命令内 fence 的录制，保留原 SDK ABI、精确范围和资源生命周期。DrawElements 捕获索引类型、数量和对应 live pool；copy 保存两个 image/view 与两个24字节区域，不把不同格式复制预先解释成原始字节复制。Fence 录制持有独立引用，即使原 Sync 对象销毁也不悬空；录制本身不提前提交或发出完成信号。WindowAcquire 目前只发放尚未呈现的初始图像，耗尽后明确失败，没有静默复用正在使用的图像。
+
+新版模块实际到达 nvnQueueSubmitCommands，诊断遍历取得首批35条命令：1920×1080 RGB10A2 颜色与0x36深度模板目标、清屏、VS/PS、128字节顶点常量、16字节顶点步长、4个 ushort 索引的 triangle strip，以及 RGB10A2→RGBA8 复制、两次计时和 fence。当前提交函数只检查并输出录制内容，最后明确退出42 `Metal command replay not implemented (submission inspected)`；没有执行这些游戏绘制或完成其 fence。不同格式复制的转换语义尚需核实。
+
+本次真实首绘使用的 PS alpha 条件为 Greater、参考值0。转换器增加 `greater-zero` 特化，元数据记录条件/参考值及 Mac/iOS metallib SHA-256。使用该原始片段着色器和合成顶点的 GPU 测试，alpha=0 的16个像素保留蓝色清屏，alpha=0.5与1.0各16像素输出正确红色和alpha；旧 Always 库在同一用例失败。此为独立着色器探针，不是游戏命令重放或标题画面。新版整批库仍为127成功、1个几何阶段失败。
+
+GPU 时间戳验证使用 Metal timestamp counter set，前后 sampleTimestamps 配对换算为纳秒，128位中间乘法覆盖全宽数值、退化区间和区间外样本。空 blit 编码器实测没有产生样本，读回为0；含可校验 GPU fill 的编码器产生四个非零有序样本，全部处于配对区间内，GPU写入逐字节校验通过。运行时计数命令尚未接入该采样执行；GetTimestamp 读取16字节 counter-data 的后8字节，要求未来 writer 已完成纳秒归一化。
+
+完整 native 回归（含 ASan/UBSan、TSan、Metal counter、copy与fence生命周期）、22项Python测试和iOS arm64编译检查通过。证据仍不包含实际游戏绘图、可安装App/IPA或真机安装。
+
+独立审查发现提交诊断器对截断viewport等命令缺少payload长度检查；ASan真实复现堆越界。现已在任何参数读取或SDK getter调用前，按opcode校验固定长度、顶点可变长度与数量，拒绝未知opcode。六组畸形输入均退出42；修复后真实游戏35条提交命令仍全部通过检查，并保持相同的未实现重放停止点。
+
+复审另发现可通过单独篡改opcode使合法lease被按错误类型解释。lease现保存录制时的原opcode，读取资源时要求opcode和命令总长度精确匹配；新增合法render-target记录被改为copy的回归，实测在对象解引用前退出42。此类型变体的修复前运行因自动审批超时未执行，不声称已取得修复前ASan证据。

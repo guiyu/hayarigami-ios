@@ -57,7 +57,11 @@ int main(void) {
     hy_commands_begin(&vertex);uint32_t attributes[]={0x1234,0x9876};
     hy_commands_attributes(&vertex,2,attributes);memset(attributes,0,sizeof attributes);
     size_t streams_offset=vertex.used;uint32_t streams[]={32,0,16,2};
-    hy_commands_streams(&vertex,2,streams);memset(streams,0,sizeof streams);hy_commands_end(&vertex);
+    hy_commands_streams(&vertex,2,streams);memset(streams,0,sizeof streams);
+    size_t cache_offset=vertex.used;hy_commands_tiled_cache(&vertex,3);size_t barrier_offset=vertex.used;
+    hy_commands_barrier(&vertex,0x19);hy_commands_end(&vertex);
+    assert(*(uint32_t *)(vertex_bytes+barrier_offset+8)==0x19);
+    assert(*(uint32_t *)(vertex_bytes+cache_offset+8)==3);
     assert(*(uint32_t *)(vertex_bytes+streams_offset+16)==32 && *(uint32_t *)(vertex_bytes+streams_offset+28)==2);
     assert(*(uint32_t *)(vertex_bytes+16)==2 && *(uint32_t *)(vertex_bytes+24)==0x1234 && *(uint32_t *)(vertex_bytes+28)==0x9876);
     puts("PASS: command payload snapshot, segment callback/jump, persistent handles and bounds");

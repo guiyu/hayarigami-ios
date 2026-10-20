@@ -21,6 +21,7 @@ compile_run account tests/test_account.c
 compile_run shader-layout tests/test_shader_layout.c
 compile_run loader-symbols tests/test_loader_symbols.c
 compile_run commands tests/test_commands.c
+compile_run gpu-time tests/test_gpu_time.c
 compile_run texture-layout tests/test_texture_layout.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined \
     tests/test_filesystem.c src/runtime/filesystem.c -o "$OUT/filesystem"
@@ -73,6 +74,28 @@ done
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_metal_sampler.m \
     -framework Metal -framework Foundation -o "$OUT/sampler"
 "$OUT/sampler"
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_gpu_counter.m \
+    -framework Metal -framework Foundation -o "$OUT/gpu-counter"
+"$OUT/gpu-counter"
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
+    tests/test_command_sync.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/command-sync"
+"$OUT/command-sync"
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
+    tests/test_command_submit.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/command-submit"
+for opcode in 15 24 13 7 26 999 type; do
+    if "$OUT/command-submit" "$opcode" > "$OUT/command-submit-$opcode.log" 2>&1; then
+        echo 'FAIL: malformed command accepted' >&2;exit 1
+    else
+        check_rc=$?;test "$check_rc" -eq 42
+        case "$opcode" in
+            999) rg -q 'unknown recorded command opcode' "$OUT/command-submit-$opcode.log" ;;
+            type) rg -q 'recorded command resource was overwritten, altered or released' "$OUT/command-submit-$opcode.log" ;;
+            *) rg -q 'invalid command payload length' "$OUT/command-submit-$opcode.log" ;;
+        esac
+    fi
+done
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc \
     tests/test_program.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
     -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/program"
@@ -97,6 +120,16 @@ if "$OUT/render-targets" --reject-uniform-range > "$OUT/uniform-reject.log" 2>&1
 else
     check_rc=$?;test "$check_rc" -eq 42
     rg -q 'uniform buffer outside live memory pools' "$OUT/uniform-reject.log"
+fi
+xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc -fsanitize=address,undefined \
+    tests/test_texture_copy.m src/gfx/bc7.c src/gfx/nvn_tex.c src/gfx/nvn_deswizzle.c \
+    -framework Metal -framework Foundation -framework QuartzCore -o "$OUT/texture-copy"
+"$OUT/texture-copy"
+if "$OUT/texture-copy" --reject-copy-range > "$OUT/texture-copy-reject.log" 2>&1; then
+    echo 'FAIL: out-of-bounds texture copy accepted' >&2;exit 1
+else
+    check_rc=$?;test "$check_rc" -eq 42
+    rg -q 'texture copy region outside image bounds' "$OUT/texture-copy-reject.log"
 fi
 xcrun clang -std=c11 -Wall -Wextra -Werror -O1 -g -fobjc-arc tests/test_bc7_metal.m src/gfx/bc7.c \
     -framework Metal -framework Foundation -o "$OUT/bc7-metal"

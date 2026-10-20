@@ -31,6 +31,9 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < 0x8000; i++) bytes[i] = (uint8_t)(i * 17 + 3);
         uint64_t device_object; uint32_t device_builder = 0;
         assert(initialize_device(&device_object, &device_builder));
+        uint64_t (*timestamp_ns)(const void *,const HyCounterData *)=lookup("nvnDeviceGetTimestampInNanoseconds");
+        HyCounterData timestamp={UINT64_MAX,123456789};assert(timestamp_ns(&device_object,&timestamp)==123456789);
+        timestamp.timestamp=UINT64_MAX;assert(timestamp_ns(&device_object,&timestamp)==UINT64_MAX);
         PoolBuilder builder; pool_defaults(&builder); pool_device(&builder, &device_object);
         pool_storage(&builder, bytes + 0x1000, 0x5000); pool_flags(&builder, 0x24);
         Pool *pool = NULL; assert(pool_initialize(&pool, &builder));
@@ -145,6 +148,9 @@ int main(int argc, char **argv) {
         assert(clear.status == MTLCommandBufferStatusCompleted);
         [gpu_image getBytes:copied bytesPerRow:19*4 fromRegion:MTLRegionMake2D(0,0,19,17) mipmapLevel:0];
         for (size_t i=0;i<sizeof copied;i+=4) assert(copied[i]==255 && copied[i+1]==0 && copied[i+2]==0 && copied[i+3]==255);
+        int (*width)(const Texture *)=lookup("nvnTextureGetWidth");
+        int (*height)(const Texture *)=lookup("nvnTextureGetHeight");
+        assert(width(&texture)==19 && height(&texture)==17);
         Texture alias; assert(texture_initialize(&alias,&tb)); assert(alias.image==texture.image);
         WindowBuilder wb={.device=&device_object}; window_defaults(&wb);
         window_native(&wb,native); Texture *window_images[]={&texture,&alias}; window_textures(&wb,2,window_images);
@@ -154,6 +160,12 @@ int main(int argc, char **argv) {
         assert(set_interval && get_interval && get_interval(&window)==1);
         set_interval(&window,0); assert(get_interval(&window)==0);
         set_interval(&window,1); assert(get_interval(&window)==1);
+        int (*acquire)(Window *,GpuSync **,int *)=lookup("nvnWindowAcquireTexture");
+        GpuSync *available=NULL;assert(sync_initialize(&available,&device_object));
+        int image_index=-1;assert(!acquire(&window,&available,&image_index) && image_index==0);
+        int ready=sync_wait(&available,2000000000);assert(ready==0 || ready==1);
+        assert(!acquire(&window,&available,&image_index) && image_index==1);
+        ready=sync_wait(&available,2000000000);assert(ready==0 || ready==1);sync_finalize(&available);
         int crop[4]; window_get_crop(&window,crop); assert(!memcmp(crop,(int[]){1,2,18,15},sizeof crop));
         texture_finalize(&texture); assert(!texture.image && pool->textures->references==1);
         [(__bridge id<MTLTexture>)alias.image getBytes:copied bytesPerRow:19*4 fromRegion:MTLRegionMake2D(0,0,19,17) mipmapLevel:0];

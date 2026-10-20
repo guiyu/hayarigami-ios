@@ -31,11 +31,20 @@ int main(int argc,char **argv) {
         void (*uniform)(HyCommands *,int,int,uint64_t,size_t)=lookup("nvnCommandBufferBindUniformBuffer");
         uint64_t address=pool_address(&pool)+0x100;
         if(argc>1 && !strcmp(argv[1],"--reject-uniform-range")) address=pool_address(&pool)+pool->size-16;
-        size_t uniform_offset=c.used;uniform(&c,0,3,address,64);hy_commands_end(&c);
+        size_t uniform_offset=c.used;uniform(&c,0,3,address,64);
         HyBoundBuffer *bound=(__bridge HyBoundBuffer *)*(void **)((uint8_t *)command_storage+uniform_offset+8);
         assert(bound->stage==0 && bound->index==3 && bound->length==64 && pool->buffers==1);
         ((uint8_t *)memory)[0x100]=0x91;
         assert(((uint8_t *)bound->buffer.contents)[bound->offset]==0x91);bound=nil;
+        void (*vertices)(HyCommands *,int,int,const HyGpuBufferRange *)=lookup("nvnCommandBufferBindVertexBuffers");
+        HyGpuBufferRange ranges[]={{pool_address(&pool)+0x200,96},{0,0}};
+        size_t vertex_offset=c.used;vertices(&c,5,2,ranges);ranges[0].address=0;
+        HyBoundBuffer *vertex=(__bridge HyBoundBuffer *)*(void **)((uint8_t *)command_storage+vertex_offset+8);
+        assert(vertex->stage==-1 && vertex->index==5 && vertex->offset==pool->offset+0x200 && vertex->length==96 && pool->buffers==2);vertex=nil;
+        void (*draw)(HyCommands *,int,int,int,uint64_t)=lookup("nvnCommandBufferDrawElements");
+        size_t draw_offset=c.used;draw(&c,4,1,3,pool_address(&pool)+0x300);hy_commands_end(&c);
+        HyDrawIndexed *indexed=(__bridge HyDrawIndexed *)*(void **)((uint8_t *)command_storage+draw_offset+8);
+        assert(indexed->primitive==4 && indexed->index_type==1 && indexed->count==3 && indexed->indices->length==6 && pool->buffers==3);indexed=nil;
         texture_finalize(&texture);
         // Releasing referenced storage invalidates its old command leases, even when command bytes live in another pool.
         pool_finalize(&pool);assert(!pool);free(memory);

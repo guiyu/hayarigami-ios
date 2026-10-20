@@ -5,8 +5,11 @@
 typedef struct { uint32_t op, size; } HyRecord;
 enum { HY_BEGIN = 1, HY_END, HY_JUMP, HY_TEXTURE_POOL, HY_SAMPLER_POOL,
     HY_MULTISAMPLE_STATE, HY_COLOR_STATE, HY_BLEND_STATE, HY_CHANNEL_MASK_STATE,
-    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER, HY_DEPTH_RANGE, HY_DEPTH_CLAMP, HY_VIEWPORT, HY_SCISSOR, HY_RENDER_TARGETS, HY_CLEAR_COLOR, HY_CLEAR_DEPTH, HY_BIND_PROGRAM, HY_UNIFORM_BUFFER, HY_STENCIL_MASK, HY_STENCIL_VALUE_MASK, HY_ALPHA_REF, HY_STENCIL_REF, HY_VERTEX_ATTRIBUTES, HY_VERTEX_STREAMS };
+    HY_POLYGON_STATE, HY_DEPTH_STENCIL_STATE, HY_REPORT_COUNTER, HY_DEPTH_RANGE, HY_DEPTH_CLAMP, HY_VIEWPORT, HY_SCISSOR, HY_RENDER_TARGETS, HY_CLEAR_COLOR, HY_CLEAR_DEPTH, HY_BIND_PROGRAM, HY_UNIFORM_BUFFER, HY_STENCIL_MASK, HY_STENCIL_VALUE_MASK, HY_ALPHA_REF, HY_STENCIL_REF, HY_VERTEX_ATTRIBUTES, HY_VERTEX_STREAMS, HY_VERTEX_BUFFER, HY_DRAW_ELEMENTS, HY_COPY_TEXTURE, HY_TILED_CACHE, HY_BARRIER, HY_FENCE_SYNC };
 typedef struct { uint64_t address; int type; } HyCounterRecord;
+typedef struct { uint64_t counter,timestamp; } HyCounterData;
+typedef struct { int32_t x,y,z,width,height,depth; } HyCopyRegion;
+_Static_assert(sizeof(HyCopyRegion)==24,"NVN copy region ABI");
 typedef struct { int32_t index; uint32_t mask; float color[4]; } HyClearColorRecord;
 typedef struct { void *shaders; uint32_t stages; } HyProgramRecord;
 typedef struct { float depth; uint32_t depth_mask; int32_t stencil; uint32_t stencil_mask; } HyClearDepthRecord;
@@ -102,6 +105,14 @@ static inline void hy_commands_streams(HyCommands *c,int count,const void *strea
     if (count<0 || count>16 || (count && !streams)) hy_fail("unsupported vertex stream count");
     uint32_t *record=hy_commands_record(c,HY_VERTEX_STREAMS,8+(size_t)count*8);
     record[0]=(uint32_t)count;if (count) memcpy(record+2,streams,(size_t)count*8);
+}
+static inline void hy_commands_tiled_cache(HyCommands *c,uint32_t action) {
+    if (action<1 || action>6) hy_fail("unsupported tiled cache action");
+    memcpy(hy_commands_record(c,HY_TILED_CACHE,sizeof action),&action,sizeof action);
+}
+static inline void hy_commands_barrier(HyCommands *c,uint32_t flags) {
+    if (flags&~255u) hy_fail("unsupported barrier flags");
+    memcpy(hy_commands_record(c,HY_BARRIER,sizeof flags),&flags,sizeof flags);
 }
 static inline void hy_commands_begin(HyCommands *c) {
     if (c->recording) hy_fail("nested NVN command recording");

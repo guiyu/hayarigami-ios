@@ -115,3 +115,23 @@ xcrun clang -fobjc-arc tests/probe_shader.m -framework Foundation -framework Met
 依赖目录须含 Ryujinx.Common.dll、Ryujinx.Graphics.Shader.dll、Spv.Generator.dll；工具报告记录 SHA-256。这是外部本地依赖，仓库没有附带其源码或二进制。当前128组中1组几何阶段拒绝，整批命令返回失败并保留每项报告；不应改成忽略失败。可用重复的 `--key` 对指定项独立构建。当前示例 GPU 探针针对最初基本二维采样 vertex/fragment 配对，不是任意 shader 自动验收。
 
 诊断启动在进入 SDK Start 时设置120秒上限。默认不输出每次已知系统调用；需要详细定位时设置 `HY_TRACE_SVC=1`，保留本地日志。主动 Break 和未实现接口仍输出停止信息与可用调用栈。
+
+## 首绘 alpha 特化与 GPU 计时复核
+
+完整基础库和选定特化必须分目录输出，避免选定 key 的 manifest 覆盖整批记录：
+
+```sh
+"$PY" scripts/build_shaders.py --source .local/shaders/source \
+  --dependencies /absolute/path/to/audited/generic/translator/libraries \
+  --out "$PWD/.local/shaders/metal-v2"
+"$PY" scripts/build_shaders.py --source .local/shaders/source \
+  --dependencies /absolute/path/to/audited/generic/translator/libraries \
+  --out "$PWD/.local/shaders/metal-v2/alpha5-ref0" --alpha-test greater-zero \
+  --key 803c26109c02466dc4077dcf0644fc0ce9b020061279fe179ce683b4a33eddb0
+xcrun clang -std=c11 -Wall -Wextra -Werror -fobjc-arc tests/probe_alpha.m \
+  -framework Foundation -framework Metal -o .local/runtime/probe-alpha
+.local/runtime/probe-alpha .local/shaders/metal-v2/alpha5-ref0/803c26109c02466dc4077dcf0644fc0ce9b020061279fe179ce683b4a33eddb0.macosx.metallib
+sh scripts/check_native.sh
+```
+
+首条整批构建仍会因1个不支持的几何阶段返回1；必须检查 manifest，不能称作全阶段通过。运行时加载尚待实现，须校验来源、Profile、阶段、alpha条件及 MetalLibraries 哈希。`test_gpu_counter.m` 已纳入 native 检查，验证真实 GPU 时间戳及纳秒校准；它不使尚未实现的游戏 ReportCounter 自动完成。首次提交的诊断仍明确失败；最新停止点取代此前 BindVertexBuffers 停止点。
