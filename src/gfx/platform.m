@@ -280,6 +280,53 @@ typedef struct { uint64_t address; const void *control; } HyShaderData;
 @end
 @implementation HyShader
 @end
+static NSString *shader_digest(NSData *data) {
+    if(!data || data.length>UINT32_MAX) hy_fail("invalid shader hash input");
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];char hex[65];
+    CC_SHA256(data.bytes,(CC_LONG)data.length,digest);
+    for(unsigned i=0;i<sizeof digest;i++) snprintf(hex+2*i,3,"%02x",digest[i]);
+    return @(hex);
+}
+// Returns a function from the exact library bytes whose hash was checked.
+id<MTLFunction> hy_metal_shader(HyShader *shader,NSString *root,int alpha,float reference,NSDictionary **reflection) {
+    if(!device || !root.length || !shader || (shader->stage!=1 && shader->stage!=5) ||
+       (alpha!=8 && alpha!=5) || reference!=0 || (shader->stage==1 && alpha!=8))
+        hy_fail("unsupported Metal shader specialization");
+    HyShaderLayout layout;
+    if(!hy_shader_layout(shader->control.bytes,shader->control.length,&layout) || layout.stage!=shader->stage ||
+       shader->code.length!=layout.code_size || shader->constants.length!=layout.constant_size ||
+       ![shader_digest(shader->control) isEqual:@(shader->key)]) hy_fail("shader snapshot identity mismatch");
+    NSString *directory=alpha==5 ? [root stringByAppendingPathComponent:@"alpha5-ref0"] : root;
+    NSString *base=[directory stringByAppendingPathComponent:@(shader->key)];
+    NSData *json=[NSData dataWithContentsOfFile:[base stringByAppendingString:@".json"]];NSError *error=nil;
+    id parsed=json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:&error] : nil;
+    if(![parsed isKindOfClass:NSDictionary.class]) hy_fail("Metal shader metadata unavailable or malformed");
+    NSDictionary *metadata=parsed;
+    if(![metadata[@"Profile"] isEqual:@"float-2d-upper-left-zero-one-v1"] ||
+       ![metadata[@"Stage"] isEqual:@(shader->stage)] || ![metadata[@"AlphaTestFunction"] isEqual:@(alpha)] ||
+       ![metadata[@"AlphaTestReference"] isEqual:@(reference)] ||
+       ![metadata[@"CodeSha256"] isEqual:shader_digest(shader->code)] ||
+       ![metadata[@"ConstantsSha256"] isEqual:shader_digest(shader->constants)])
+        hy_fail("Metal shader source/profile mismatch");
+#if TARGET_OS_IPHONE
+    NSString *sdk=@"iphoneos";
+#else
+    NSString *sdk=@"macosx";
+#endif
+    NSString *path=[base stringByAppendingFormat:@".%@.metallib",sdk];
+    NSData *binary=[NSData dataWithContentsOfFile:path];id hashes=metadata[@"MetalLibraries"];
+    if(!binary.length || ![hashes isKindOfClass:NSDictionary.class] ||
+       ![hashes[sdk] isEqual:shader_digest(binary)]) hy_fail("Metal library hash mismatch");
+    dispatch_data_t bytes=dispatch_data_create(binary.bytes,binary.length,
+        dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{(void)binary;});
+    id<MTLLibrary> library=[device newLibraryWithData:bytes error:&error];
+    if(!library) hy_fail("Metal library load failed: %s",error.localizedDescription.UTF8String);
+    id<MTLFunction> function=[library newFunctionWithName:@"main0"];
+    if(!function || function.functionType!=(shader->stage==1 ? MTLFunctionTypeVertex : MTLFunctionTypeFragment))
+        hy_fail("Metal library entrypoint/stage mismatch");
+    if(reflection) *reflection=metadata;
+    return function;
+}
 static uint32_t program_initialize(void **object,const void *d) {
     if (!device || !d) hy_fail("program device missing");
     *object=(__bridge_retained void *)[NSArray array]; return 1;

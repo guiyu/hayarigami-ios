@@ -135,3 +135,11 @@ sh scripts/check_native.sh
 ```
 
 首条整批构建仍会因1个不支持的几何阶段返回1；必须检查 manifest，不能称作全阶段通过。运行时加载尚待实现，须校验来源、Profile、阶段、alpha条件及 MetalLibraries 哈希。`test_gpu_counter.m` 已纳入 native 检查，验证真实 GPU 时间戳及纳秒校准；它不使尚未实现的游戏 ReportCounter 自动完成。首次提交的诊断仍明确失败；最新停止点取代此前 BindVertexBuffers 停止点。
+
+真实首绘VS/PS的库完整性及GPU布局回归（依赖本地游戏派生缓存，不并入无游戏文件的合成检查）：
+
+```sh
+sh tests/check_shader_draw.sh .local/shaders/source .local/shaders/metal-v2
+```
+
+该测试验证256个实际GPU像素与六个拒绝路径，不代替队列执行、标题画面、签名安装验收。安装交付标准已明确为能进入游戏，不能以诊断版替代。
